@@ -90,3 +90,15 @@ class AnthropicAPIKeyProvider(LLMProvider):
             if block.get("type") == "text":
                 return block.get("text", "")
         return ""
+
+    @classmethod
+    def validate_config(cls, config) -> list[str]:
+        key = config.get("llm", "anthropic_api_key", fallback="") or config.get(
+            "llm", "api_key", fallback=""
+        )
+        if not key:
+            return [
+                "anthropic_apikey: missing [llm] anthropic_api_key "
+                "(get one at https://console.anthropic.com/settings/keys)"
+            ]
+        return []

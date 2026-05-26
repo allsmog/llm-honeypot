@@ -36,5 +36,20 @@ class ProviderRegistry:
         return cls._registry[name](config)
 
     @classmethod
+    def validate(cls, name: str, config: ConfigParser) -> list[str]:
+        """Dispatch validate_config to the named provider.
+
+        Returns a list of error strings (empty = OK). Raises ValueError
+        if the provider name itself is unknown — that's a config typo,
+        not a credential gap.
+        """
+        if name not in cls._registry:
+            available = ", ".join(sorted(cls._registry)) or "<none registered>"
+            raise ValueError(
+                f"Unknown LLM provider {name!r}. Available providers: {available}"
+            )
+        return cls._registry[name].validate_config(config)
+
+    @classmethod
     def available(cls) -> list[str]:
         return sorted(cls._registry)

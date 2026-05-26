@@ -194,6 +194,19 @@ class LLMProvider(ABC):
         """
         return False
 
+    @classmethod
+    def validate_config(cls, config: ConfigParser) -> list[str]:
+        """Return a list of human-readable errors for this provider's config.
+
+        Empty list means the config is structurally valid (i.e. all
+        required credential fields are present). Does NOT validate that
+        the credential is live / accepted by the upstream — that's a
+        network round trip we don't want at startup.
+
+        Override in subclasses.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Internal HTTP helpers
 

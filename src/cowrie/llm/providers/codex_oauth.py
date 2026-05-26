@@ -165,6 +165,18 @@ class CodexOAuthProvider(LLMProvider):
             return payload["output_text"]
         return ""
 
+    @classmethod
+    def validate_config(cls, config) -> list[str]:
+        path = os.path.expanduser(
+            config.get("llm", "codex_oauth_token_file", fallback="~/.codex/auth.json")
+        )
+        if not Path(path).is_file():
+            return [
+                f"codex_oauth: no Codex CLI credentials at {path}. "
+                "Run `codex auth login` or set [llm] codex_oauth_token_file."
+            ]
+        return []
+
     def _on_auth_failure(self) -> bool:
         # The Codex CLI refreshes ~/.codex/auth.json when its refresh
         # interval elapses. Re-read; retry once iff the token actually

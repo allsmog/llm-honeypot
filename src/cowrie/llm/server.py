@@ -27,5 +27,10 @@ class CowrieServer:
         self.hostname = CowrieConfig.get("honeypot", "hostname", fallback="svr04")
         log.msg(f"LLM backend server using hostname: {self.hostname}")
 
+        # Expose the realm-owned LLMClient so per-session protocols don't
+        # have to construct their own. Shared instance = shared HTTP
+        # connection pool + shared OAuth-token state across sessions.
+        self.llm_client = getattr(realm, "llm_client", None)
+
         # We don't need a virtual filesystem for the LLM backend
         # The LLM will simulate all filesystem interactions

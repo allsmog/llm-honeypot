@@ -72,3 +72,15 @@ class CodexAPIKeyProvider(LLMProvider):
         if not choices:
             return ""
         return choices[0].get("message", {}).get("content", "")
+
+    @classmethod
+    def validate_config(cls, config) -> list[str]:
+        key = config.get("llm", "openai_api_key", fallback="") or config.get(
+            "llm", "api_key", fallback=""
+        )
+        if not key:
+            return [
+                "codex_apikey: missing [llm] openai_api_key "
+                "(get one at https://platform.openai.com/api-keys)"
+            ]
+        return []

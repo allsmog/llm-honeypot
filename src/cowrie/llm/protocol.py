@@ -289,7 +289,12 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             return
 
         if not hasattr(self, "llm_client"):
-            self.llm_client = LLMClient()
+            # Prefer the realm-owned client (constructed once at startup,
+            # shared across sessions). Fall back to per-session construction
+            # so unit tests / exec mode that don't go through the realm
+            # still work. Either path has already been validated.
+            shared = getattr(self.user.server, "llm_client", None)
+            self.llm_client = shared if shared is not None else LLMClient()
             self.command_history = []
 
         self.command_history.append(f"User: {command}")
@@ -415,7 +420,8 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         Process an exec command with the LLM and return the result.
         Used when commands are passed directly to SSH (e.g., ssh user@host 'command')
         """
-        self.llm_client = LLMClient()
+        shared = getattr(self.user.server, "llm_client", None)
+        self.llm_client = shared if shared is not None else LLMClient()
         self.command_history = []
 
         # Construct the prompt
@@ -468,7 +474,8 @@ class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLin
         HoneyPotBaseProtocol.connectionMade(self)
         recvline.HistoricRecvLine.connectionMade(self)
 
-        self.llm_client = LLMClient()
+        shared = getattr(self.user.server, "llm_client", None)
+        self.llm_client = shared if shared is not None else LLMClient()
         self.command_history = []
 
         # Show welcome banner

@@ -60,12 +60,21 @@ class LLMClient:
     def __init__(self) -> None:
         provider_name = CowrieConfig.get("llm", "provider", fallback=DEFAULT_PROVIDER)
         try:
-            self.provider: LLMProvider = ProviderRegistry.create(
-                provider_name, CowrieConfig
-            )
+            errors = ProviderRegistry.validate(provider_name, CowrieConfig)
         except ValueError as e:
+            # Unknown provider name — that's a config typo, not a credential gap.
             log.err(f"LLM provider init failed: {e}")
             raise
+        if errors:
+            joined = "\n  - " + "\n  - ".join(errors)
+            log.err(f"LLM provider {provider_name!r} config validation failed:{joined}")
+            raise RuntimeError(
+                f"LLM provider {provider_name!r} is misconfigured. "
+                f"Errors:{joined}"
+            )
+        self.provider: LLMProvider = ProviderRegistry.create(
+            provider_name, CowrieConfig
+        )
         self.max_tokens = CowrieConfig.getint("llm", "max_tokens", fallback=500)
         self.temperature = CowrieConfig.getfloat("llm", "temperature", fallback=0.7)
         log.msg(

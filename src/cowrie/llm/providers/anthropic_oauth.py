@@ -191,6 +191,44 @@ class AnthropicOAuthProvider(LLMProvider):
                 return block.get("text", "")
         return ""
 
+    @classmethod
+    def validate_config(cls, config) -> list[str]:
+        # Either an explicit token file exists, or on macOS the keychain
+        # entry exists. We can't check keychain at module-import time on
+        # non-darwin platforms, so accept "no file + non-darwin" as a
+        # config error.
+        token_file = os.path.expanduser(
+            config.get("llm", "anthropic_oauth_token_file", fallback="")
+        )
+        if token_file and Path(token_file).is_file():
+            return []
+        if sys.platform == "darwin":
+            service = config.get(
+                "llm", "anthropic_oauth_keychain_service",
+                fallback=MACOS_KEYCHAIN_SERVICE,
+            )
+            try:
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-s", service],
+                    capture_output=True, text=True, timeout=3, check=False,
+                )
+                if result.returncode == 0:
+                    return []
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+            return [
+                f"anthropic_oauth: no token at [llm] anthropic_oauth_token_file "
+                f"and no keychain entry for service {service!r}. "
+                "Run `claude auth login` or set anthropic_oauth_token_file."
+            ]
+        default_path = os.path.expanduser(LINUX_DEFAULT_PATH)
+        if Path(default_path).is_file():
+            return []
+        return [
+            f"anthropic_oauth: no token at {default_path} and no override "
+            "in [llm] anthropic_oauth_token_file. Run `claude auth login`."
+        ]
+
     def _on_auth_failure(self) -> bool:
         # Re-read the source-of-truth (keychain on macOS, file otherwise).
         # If Claude Code has refreshed the token since we loaded it, the
