@@ -164,3 +164,14 @@ class CodexOAuthProvider(LLMProvider):
         if isinstance(payload.get("output_text"), str):
             return payload["output_text"]
         return ""
+
+    def _on_auth_failure(self) -> bool:
+        # The Codex CLI refreshes ~/.codex/auth.json when its refresh
+        # interval elapses. Re-read; retry once iff the token actually
+        # changed. Mirrors the logic in anthropic_oauth.
+        old = self._token
+        new = self._load_token()
+        if new and new != old:
+            self._token = new
+            return True
+        return False

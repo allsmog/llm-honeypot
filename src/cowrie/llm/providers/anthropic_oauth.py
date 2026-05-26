@@ -190,3 +190,18 @@ class AnthropicOAuthProvider(LLMProvider):
             if block.get("type") == "text":
                 return block.get("text", "")
         return ""
+
+    def _on_auth_failure(self) -> bool:
+        # Re-read the source-of-truth (keychain on macOS, file otherwise).
+        # If Claude Code has refreshed the token since we loaded it, the
+        # new value will differ — retry once with the fresh token. If it
+        # hasn't changed, the 401 reflects a real auth problem (revoked,
+        # expired without refresh, user logged out) and retrying just
+        # burns a round-trip.
+        old = self._token
+        new, expires = self._load_token()
+        if new and new != old:
+            self._token = new
+            self._expires_at = expires
+            return True
+        return False

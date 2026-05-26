@@ -164,6 +164,9 @@ class LLMProvider(ABC):
         session has to keep going regardless — we'd rather show an empty
         prompt than crash the attacker's session and tip them off.
         """
+        return self._generate(request, retried=False)
+
+    def _generate(self, request: LLMRequest, retried: bool) -> Deferred:
         body = self._format_body(request)
         if self.debug:
             log.msg(f"LLM[{self.name}] request: {json.dumps(body, indent=2)}")
@@ -175,8 +178,21 @@ class LLMProvider(ABC):
             bodyProducer=_StringProducer(json.dumps(body)),
         )
         d.addCallbacks(self._read_body, self._connection_error)
-        d.addCallback(self._handle_status)
+        # Pass request + retried via callback args so _handle_status can
+        # decide whether to reload-and-retry on 401 without stashing state
+        # on self (which would race across overlapping sessions).
+        d.addCallback(self._handle_status, request, retried)
         return d
+
+    def _on_auth_failure(self) -> bool:
+        """Hook for providers backed by refreshable credentials.
+
+        Called when the upstream returns HTTP 401. Override to reload the
+        credential (e.g. re-read the OAuth token file or keychain entry).
+        Return True iff the reload produced a *different* token and a
+        retry is worth attempting; False stops the retry chain.
+        """
+        return False
 
     # ------------------------------------------------------------------
     # Internal HTTP helpers
@@ -191,8 +207,17 @@ class LLMProvider(ABC):
         log.err(f"LLM[{self.name}] connection error: {err.getErrorMessage()}")
         return (599, err.getErrorMessage().encode("utf-8"))
 
-    def _handle_status(self, result: tuple[int, bytes]) -> str:
+    def _handle_status(
+        self, result: tuple[int, bytes], request: LLMRequest, retried: bool
+    ):
         status, body = result
+        if status == 401 and not retried and self._on_auth_failure():
+            log.msg(
+                eventid="cowrie.llm.token_reloaded",
+                provider=self.name,
+                format="LLM[%(provider)s] credential reloaded after 401; retrying once",
+            )
+            return self._generate(request, retried=True)
         if status != 200:
             log.err(
                 f"LLM[{self.name}] HTTP {status}: {body.decode('utf-8', errors='replace')}"
