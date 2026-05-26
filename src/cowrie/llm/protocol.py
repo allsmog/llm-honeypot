@@ -138,8 +138,77 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         log.msg(eventid="cowrie.command.input", input=string, format="CMD: %(input)s")
 
-        # Use LLM client to get a response
+        if self._try_fastpath(string):
+            return
         self._process_command_with_llm(string)
+
+    def _try_fastpath(self, command: str) -> bool:
+        """Handle trivial commands locally without an LLM round-trip.
+
+        Returns True iff handled. The fastpath exists for two reasons:
+        (1) ``exit`` must actually close the session, not be answered with
+        another prompt; (2) ``cd`` must update ``self.cwd`` so the next LLM
+        turn sees consistent state. Per-LLM latency for these is wasted.
+        """
+        stripped = command.strip()
+        if not stripped:
+            self._show_prompt()
+            return True
+
+        parts = stripped.split(None, 1)
+        head = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if head in ("exit", "logout", "quit"):
+            if self.terminal is not None:
+                self.terminal.loseConnection()
+            return True
+
+        if head == "clear":
+            if self.terminal is not None:
+                self.terminal.eraseDisplay()
+                self.terminal.cursorHome()
+            self._show_prompt()
+            return True
+
+        if head == "pwd":
+            if self.terminal is not None:
+                self.terminal.write(f"{self.cwd}\n".encode())
+            self._show_prompt()
+            return True
+
+        if head == "cd":
+            self._handle_cd(rest.strip())
+            return True
+
+        return False
+
+    def _handle_cd(self, arg: str) -> None:
+        """Resolve ``cd <arg>`` against ``self.cwd`` and update it in place.
+
+        We have no real filesystem, so any path is accepted. The LLM will
+        produce file listings consistent with whatever cwd we land on, since
+        it flows into the system prompt every turn.
+        """
+        if not arg or arg == "~":
+            new_cwd = (
+                "/root" if self.user.username == "root" else f"/home/{self.user.username}"
+            )
+        elif arg == "-":
+            new_cwd = getattr(self, "_prev_cwd", self.cwd)
+        elif arg.startswith("/"):
+            new_cwd = arg
+        elif arg == "..":
+            new_cwd = "/".join(self.cwd.rstrip("/").split("/")[:-1]) or "/"
+        else:
+            base = self.cwd.rstrip("/")
+            new_cwd = f"{base}/{arg}" if base else f"/{arg}"
+
+        # Normalize: collapse trailing slashes, keep "/" as "/".
+        new_cwd = new_cwd.rstrip("/") or "/"
+        self._prev_cwd = self.cwd
+        self.cwd = new_cwd
+        self._show_prompt()
 
     def _build_system_context(self, exec_command: str = "") -> str:
         """
@@ -189,20 +258,29 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         Process a command by sending it to the LLM and writing the response
         to the terminal.
         """
-        # Initialize LLM client if needed
         if not hasattr(self, "llm_client"):
             self.llm_client = LLMClient()
             self.command_history = []
 
-        # Add the command to our history
         self.command_history.append(f"User: {command}")
 
         system_context = self._build_system_context()
-
-        # Keep only the last 10 commands for context
         prompt = [system_context, *self.command_history[-10:]]
 
-        # Get response asynchronously
+        # Pass sessionno explicitly: the response callback below fires
+        # inside the Twisted HTTP client context, where the auto-detected
+        # 'system' prefix won't match Cowrie's SSH/Telnet regex, so events
+        # would silently be dropped by the output dispatcher.
+        log.msg(
+            eventid="cowrie.llm.prompt",
+            input=command,
+            cwd=self.cwd,
+            history_depth=len(self.command_history),
+            sessionno=f"S{self.sessionno}",
+            format="LLM prompt: %(input)s",
+        )
+
+        self._llm_t0 = time.time()
         d: defer.Deferred[str] = self.llm_client.get_response(prompt)
         d.addCallback(self._handle_llm_response)
         d.addErrback(self._handle_llm_error)
@@ -211,6 +289,15 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         """
         Handle the response from the LLM and display it to the user.
         """
+        latency_ms = int((time.time() - getattr(self, "_llm_t0", time.time())) * 1000)
+        log.msg(
+            eventid="cowrie.llm.response",
+            output=response,
+            latency_ms=latency_ms,
+            sessionno=f"S{self.sessionno}",
+            format="LLM response in %(latency_ms)dms",
+        )
+
         if self.terminal is None:
             return
 
@@ -226,6 +313,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         """
         Handle errors from the LLM client.
         """
+        latency_ms = int((time.time() - getattr(self, "_llm_t0", time.time())) * 1000)
+        log.msg(
+            eventid="cowrie.llm.error",
+            error=str(err),
+            latency_ms=latency_ms,
+            sessionno=f"S{self.sessionno}",
+            format="LLM error after %(latency_ms)dms: %(error)s",
+        )
         log.err(f"LLM error: {err}")
         if self.terminal is None:
             return
