@@ -163,6 +163,40 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
   Messages and Codex Responses/chat-completions), 401-retry, validate-
   config, parser, observation rendering, leak strip, WorldState, persona.
 
+## Test coverage
+
+108 trial tests across 9 files under `src/cowrie/test/test_llm_*.py`,
+all green (2 skipped on optional deps). Logic-module coverage:
+
+| Module | Coverage |
+|---|---|
+| `persona.py` | 100% |
+| `cmd_parser.py` | 97% |
+| `worldstate.py` | 93% |
+| `providers/streaming.py` | 92% |
+| `providers/codex_apikey.py` | 90% |
+| `providers/anthropic_apikey.py` | 88% |
+| `providers/registry.py` | 88% |
+| `providers/codex_oauth.py` | 65% |
+| `protocol.py` | 65% |
+| `downloader.py` | 61% |
+| `providers/anthropic_oauth.py` | 61% |
+| `providers/base.py` | 58% |
+| `llm.py` | 31% |
+
+The Twisted glue files (`avatar.py`, `realm.py`, `server.py`,
+`session.py`, `telnet.py`) are at 0% in trial — they're integration
+points with the SSH channel layer and tested live via
+`scripts/attacker_sim.py` which exercises 6 realistic attacker patterns
+end-to-end. The 80% trial-coverage target the v1 plan called for is
+unreachable for these files without standing up a fake SSH transport.
+
+Run coverage locally:
+```bash
+coverage run --source=src/cowrie/llm -m twisted.trial cowrie.test.test_llm_*
+coverage report --include='*/cowrie/llm/*'
+```
+
 ## Known limitations
 
 - **scp payload capture is intent-only.** The downloader detects scp
