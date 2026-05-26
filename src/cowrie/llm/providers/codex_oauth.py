@@ -24,7 +24,11 @@ if TYPE_CHECKING:
 
 @ProviderRegistry.register("codex_oauth")
 class CodexOAuthProvider(LLMProvider):
-    DEFAULT_MODEL = "gpt-4o-mini"
+    # Codex CLI with ChatGPT OAuth only accepts Codex-specific models; the
+    # standard OpenAI gpt-4o-* lineup is rejected at the endpoint with a
+    # clear error. Current list comes from ~/.codex/models_cache.json and
+    # mirrors what `codex --help -c model=...` accepts.
+    DEFAULT_MODEL = "gpt-5.4-mini"
     DEFAULT_HOST = "https://chatgpt.com"
     DEFAULT_PATH = "/backend-api/codex/responses"
 
@@ -83,29 +87,80 @@ class CodexOAuthProvider(LLMProvider):
         )
 
     def _format_body(self, request: LLMRequest) -> dict[str, Any]:
-        # Codex CLI uses the OpenAI chat-completions message shape, just at
-        # a different endpoint. Keep this in lockstep with CodexAPIKey so a
-        # user can switch auth modes without re-prompting.
-        messages: list[dict[str, str]] = []
-        if request.system:
-            messages.append({"role": "system", "content": request.system})
-        messages.extend({"role": m.role, "content": m.content} for m in request.messages)
-        return {
+        # The Codex OAuth endpoint speaks the OpenAI Responses API, not
+        # chat-completions: `instructions` for system, `input` for messages,
+        # `max_output_tokens` not `max_tokens`. Verified empirically against
+        # https://chatgpt.com/backend-api/codex/responses on 2026-05-26.
+        # The Codex backend's /responses endpoint is the OpenAI Responses
+        # API shape, but with a constrained parameter set: max_output_tokens
+        # is rejected ("Unsupported parameter"), and the standard sampling
+        # knobs aren't honored either. We pass only what's accepted; honeypot
+        # responses are short by nature so token-cap loss is acceptable.
+        body: dict[str, Any] = {
             "model": self._model,
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
+            "instructions": request.system or "",
+            "input": [
+                {"role": m.role, "content": m.content} for m in request.messages
+            ] or [{"role": "user", "content": ""}],
+            "store": False,
+            "stream": True,
         }
+        return body
+
+    def _parse_body(self, body: bytes) -> str:
+        # Buffered SSE stream. Each event is a pair of lines:
+        #   event: response.output_text.delta
+        #   data: {"type":"response.output_text.delta","delta":"hello"}
+        # followed by a blank line. We accumulate delta strings and also
+        # accept the terminal "response.completed" event's `output_text`
+        # convenience field as a fallback.
+        text_chunks: list[str] = []
+        completed_text: str | None = None
+        for raw_line in body.splitlines():
+            if not raw_line.startswith(b"data:"):
+                continue
+            payload_str = raw_line[5:].strip()
+            if not payload_str or payload_str == b"[DONE]":
+                continue
+            try:
+                event = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            etype = event.get("type", "")
+            if etype == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    text_chunks.append(delta)
+            elif etype == "response.completed":
+                resp = event.get("response") or {}
+                if isinstance(resp.get("output_text"), str):
+                    completed_text = resp["output_text"]
+                else:
+                    # response.completed includes the final assembled output
+                    # for redundancy; only used as a fallback if no deltas
+                    # arrived (rare — usually means short circuit).
+                    output = resp.get("output") or []
+                    for item in output:
+                        if item.get("type") != "message":
+                            continue
+                        for block in item.get("content") or []:
+                            if block.get("type") in ("output_text", "text"):
+                                completed_text = block.get("text", "")
+                                break
+        if text_chunks:
+            return "".join(text_chunks)
+        return completed_text or ""
 
     def _parse_response(self, payload: dict[str, Any]) -> str:
-        # Try OpenAI chat-completions shape first.
-        choices = payload.get("choices") or []
-        if choices:
-            return choices[0].get("message", {}).get("content", "")
-        # Codex responses API shape: {output: [{content: [{text: "..."}]}]}
+        # Responses API shape: {output: [{type: "message", content: [{type: "output_text", text: ...}]}]}
         output = payload.get("output") or []
         for item in output:
+            if item.get("type") != "message":
+                continue
             for block in item.get("content", []):
                 if block.get("type") in ("output_text", "text"):
                     return block.get("text", "")
+        # Some Responses API responses include a convenience top-level field.
+        if isinstance(payload.get("output_text"), str):
+            return payload["output_text"]
         return ""

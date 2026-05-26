@@ -199,14 +199,22 @@ class LLMProvider(ABC):
             )
             return ""
         try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as e:
-            log.err(f"LLM[{self.name}] invalid JSON: {e}")
+            return self._parse_body(body)
+        except Exception as e:
+            log.err(
+                f"LLM[{self.name}] body parse failed ({e}): "
+                f"{body[:300].decode('utf-8', errors='replace')!r}"
+            )
             return ""
+
+    def _parse_body(self, body: bytes) -> str:
+        """Convert the raw HTTP response body into assistant text.
+
+        Default: treat as a single JSON document and delegate to
+        :meth:`_parse_response`. Providers that speak SSE (server-sent
+        events) override this directly.
+        """
+        payload = json.loads(body)
         if self.debug:
             log.msg(f"LLM[{self.name}] response: {json.dumps(payload, indent=2)}")
-        try:
-            return self._parse_response(payload)
-        except (KeyError, IndexError, TypeError) as e:
-            log.err(f"LLM[{self.name}] response parse failed ({e}): {payload!r}")
-            return ""
+        return self._parse_response(payload)
