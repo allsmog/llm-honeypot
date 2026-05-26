@@ -110,7 +110,7 @@ def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
     v1 captures the intent only — no binary SCP protocol handling.
     Actual inbound payload capture requires hooking the SSH channel
     dispatcher, which lives below the LLM protocol layer and is a
-    tracked follow-up (see FORK.md).
+    tracked follow-up (see README.md).
     """
     # The last two positional args are src and dst. Skip flags.
     positional = [a for a in args if not a.startswith("-")]
@@ -379,7 +379,7 @@ def _refuse_scp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     the LLM narrates a permission-denied or connection-closed message
     consistent with the observation block.
 
-    See FORK.md "Known limitations" for the full follow-up scope.
+    See README.md "Known limitations" for the full follow-up scope.
     """
     log_event(
         eventid="cowrie.session.scp_attempt",

@@ -6,6 +6,9 @@ static command emulator. The point is threat intel: keep attackers engaged
 longer than a brittle emulator can, and capture the full command stream
 plus the model's responses for analysis.
 
+**For production deployment** (VPS provisioning, systemd, log rotation,
+monitoring, cost estimation) see [`DEPLOY.md`](DEPLOY.md).
+
 ## What this fork adds on top of upstream Cowrie
 
 Upstream Cowrie shipped a basic `llm` backend in 2025/26 — single hardcoded
@@ -23,17 +26,20 @@ This fork replaces that with a provider abstraction:
 
 ### Built-in providers
 
-| Provider           | Auth                       | Endpoint                          |
+| Provider           | Auth                       | Endpoint / Wire format            |
 |--------------------|----------------------------|-----------------------------------|
-| `anthropic_apikey` | `x-api-key` header         | `api.anthropic.com/v1/messages`   |
-| `anthropic_oauth`  | OAuth bearer from token file | `api.anthropic.com/v1/messages` |
-| `codex_apikey`     | `Authorization: Bearer` API key | `api.openai.com/v1/chat/completions` |
-| `codex_oauth`      | OAuth bearer from token file | `chatgpt.com/backend-api/codex/responses` |
+| `anthropic_apikey` | `x-api-key` header         | `api.anthropic.com/v1/messages`, Messages API |
+| `anthropic_oauth`  | OAuth bearer (macOS Keychain by default, file fallback on Linux) | `api.anthropic.com/v1/messages`, Messages API |
+| `codex_apikey`     | `Authorization: Bearer` API key | `api.openai.com/v1/chat/completions`, chat-completions |
+| `codex_oauth`      | OAuth bearer from `~/.codex/auth.json` | `chatgpt.com/backend-api/codex/responses`, SSE Responses API (Codex models only — `gpt-5.4-mini` default) |
 
-The two OAuth providers consume a bearer token previously obtained via the
-official CLI's OAuth flow (Claude Code / Codex CLI). They don't perform the
-OAuth dance themselves — point the relevant `*_oauth_token_file` config key
-at the credentials JSON.
+OAuth providers consume a bearer token previously obtained via the official
+CLI's auth flow (`claude auth login` / `codex auth login`). They don't perform
+the OAuth dance themselves — `anthropic_oauth` reads macOS Keychain (service
+`Claude Code-credentials`) automatically; everything else is config-overridable.
+
+OAuth credentials reload-and-retry once on HTTP 401 (`_on_auth_failure` hook),
+so a token refresh by the CLI mid-session doesn't drop the next attacker command.
 
 ## Quickstart
 
@@ -231,26 +237,23 @@ coverage report --include='*/cowrie/llm/*'
   custom Twisted Agent with SNI preservation for HTTPS, which is a real
   but tractable follow-up rather than a v1 blocker.
 
-## Known limitations / TOS reminder
+## TOS reminder
 
-- **OAuth providers consume session tokens** intended for the official
-  Claude Code / Codex CLIs. For personal / research deployments to an
-  unrouteable IP this is fine. For wide-net public honeypot sensors,
-  use the API-key providers (`anthropic_apikey` / `codex_apikey`) —
-  Anthropic and OpenAI ToS restrict programmatic use of subscription
-  session tokens.
-- **Streaming responses** for `tail -f` / `top` are not implemented.
-  Upstream Cowrie's shell backend doesn't stream either, so this is
-  not a regression vs upstream — flag for a future iteration.
-- **scp payload capture** is deliberately cut. Fetching from a third-
-  party host with the attacker's credentials is operationally risky
-  enough that v1 leaves scp to the LLM's narration.
+**OAuth providers (`anthropic_oauth`, `codex_oauth`) consume session
+tokens** issued for the official Claude Code / Codex CLIs. For personal
+or research deployments to an unrouteable IP this is generally fine.
+For wide-net public honeypot sensors, **use the API-key providers**
+(`anthropic_apikey` / `codex_apikey`) — Anthropic and OpenAI TOS
+restrict programmatic use of subscription session tokens. The fail-fast
+config validation surfaces this choice clearly when you select a
+provider in `cowrie.cfg`.
 
 ## Publishing this fork to GitHub
 
-Pre-push checks already passed in CI (no credentials in history,
-`etc/cowrie.cfg` gitignored, 24 thematic commits on top of upstream
-Cowrie). To push to your own GitHub fork:
+Pre-push checks done as part of writing this doc (no credentials anywhere
+in history, `etc/cowrie.cfg` gitignored, captured payloads under
+`var/lib/cowrie/downloads/` ignored via in-dir `.gitignore`, sensitive
+state dirs all confirmed untracked). To push to your own GitHub fork:
 
 ```bash
 # Sanity re-check before pushing (run these from cowrie/):

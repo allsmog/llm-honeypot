@@ -1,7 +1,7 @@
 # DEPLOY — LLM Honeypot Production Runbook
 
 Production guidance for putting `llm-honeypot` on an internet-facing
-VPS. Read `FORK.md` first for the feature surface; this doc covers
+VPS. Read `README.md` first for the feature surface; this doc covers
 *how to operate* it.
 
 > ⚠️ **Before you deploy.** OAuth providers (`anthropic_oauth`,
@@ -20,7 +20,7 @@ VPS. Read `FORK.md` first for the feature surface; this doc covers
 
 **Hosting suggestions:** Hetzner CX22 ($4/mo), DigitalOcean basic
 droplet, Vultr basic. Avoid AWS/GCP/Azure if you can — the DNS TOCTOU
-caveat in `FORK.md` matters more on cloud hosts where instance metadata
+caveat in `README.md` matters more on cloud hosts where instance metadata
 is at 169.254.169.254. If you must deploy on cloud, **do not give the
 instance a privileged IAM role**.
 
