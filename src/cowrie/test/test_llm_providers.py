@@ -289,6 +289,57 @@ class TestCodexOAuthBody(unittest.TestCase):
 # 401-retry mechanics
 
 
+class TestAnthropicOAuthHeaderConfig(unittest.TestCase):
+    """Verify the anthropic-beta header is config-overridable.
+
+    Anthropic bumps the beta name periodically; operators need to update
+    without a code change. Default is exercised in
+    TestAuthReload.test_anthropic_oauth_reloads_*; here we just verify
+    the override is picked up.
+    """
+
+    def _make_with_token(self, **extra_config) -> tuple[AnthropicOAuthProvider, str]:
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        with open(path, "w") as f:
+            json.dump(
+                {"claudeAiOauth": {"accessToken": "tok-1", "expiresAt": 0}}, f,
+            )
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+
+        cfg = _config({"anthropic_oauth_token_file": path, **extra_config})
+        return AnthropicOAuthProvider(cfg), path
+
+    def test_default_beta_header(self):
+        provider, _ = self._make_with_token()
+        provider.agent = StubAgent(
+            body=b'{"content":[{"type":"text","text":"ok"}]}'
+        )
+        provider.generate(LLMRequest(
+            system="x", messages=[LLMMessage(role="user", content="hi")],
+        ))
+        headers = provider.agent.requests[0]["headers"]
+        beta = headers.getRawHeaders(b"anthropic-beta")
+        self.assertEqual(beta, [b"oauth-2025-04-20"])
+
+    def test_overridden_beta_header(self):
+        provider, _ = self._make_with_token(
+            anthropic_oauth_beta="oauth-2099-12-31",
+        )
+        provider.agent = StubAgent(
+            body=b'{"content":[{"type":"text","text":"ok"}]}'
+        )
+        provider.generate(LLMRequest(
+            system="x", messages=[LLMMessage(role="user", content="hi")],
+        ))
+        headers = provider.agent.requests[0]["headers"]
+        beta = headers.getRawHeaders(b"anthropic-beta")
+        self.assertEqual(beta, [b"oauth-2099-12-31"])
+
+
 class TestAuthReload(unittest.TestCase):
     def test_anthropic_apikey_no_retry_default(self):
         # The base class's _on_auth_failure returns False — API-key

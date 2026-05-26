@@ -36,9 +36,11 @@ class AnthropicOAuthProvider(LLMProvider):
     DEFAULT_MODEL = "claude-haiku-4-5-20251001"
     DEFAULT_HOST = "https://api.anthropic.com"
     API_PATH = "/v1/messages"
-    # Header required by Anthropic when authenticating with an OAuth bearer
-    # token instead of an API key. Update this if Anthropic bumps the beta.
-    OAUTH_BETA = b"oauth-2025-04-20"
+    # Default value of the anthropic-beta header required for OAuth-bearer
+    # auth. This is a moving target — Anthropic bumps it without notice —
+    # so it's exposed via [llm] anthropic_oauth_beta for operators to
+    # adjust without redeploying.
+    DEFAULT_OAUTH_BETA = "oauth-2025-04-20"
 
     def __init__(self, config: ConfigParser) -> None:
         super().__init__(config)
@@ -58,6 +60,9 @@ class AnthropicOAuthProvider(LLMProvider):
         self._cache_system = config.getboolean(
             "llm", "anthropic_cache_system", fallback=True
         )
+        self._oauth_beta = config.get(
+            "llm", "anthropic_oauth_beta", fallback=self.DEFAULT_OAUTH_BETA
+        ).encode("ascii")
 
         if self._expires_at and self._expires_at < int(time.time() * 1000):
             log.msg(
@@ -157,7 +162,7 @@ class AnthropicOAuthProvider(LLMProvider):
                 b"Content-Type": [b"application/json"],
                 b"Authorization": [f"Bearer {self._token}".encode()],
                 b"anthropic-version": [b"2023-06-01"],
-                b"anthropic-beta": [self.OAUTH_BETA],
+                b"anthropic-beta": [self._oauth_beta],
             }
         )
 

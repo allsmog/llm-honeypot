@@ -417,6 +417,12 @@ log_raw = false
 # anthropic_apikey: get a key from https://console.anthropic.com/settings/keys
 #anthropic_api_key = sk-ant-xxx
 
+# anthropic-beta header value for OAuth-bearer auth. Anthropic bumps this
+# without notice; operators can override without redeploying when the
+# server starts rejecting requests with a "wrong beta" error.
+# (default: oauth-2025-04-20)
+#anthropic_oauth_beta = oauth-2025-04-20
+
 # anthropic_oauth: by default reads the token written by `claude auth login`.
 # On macOS that lives in Keychain (service "Claude Code-credentials"); on
 # Linux it's at ~/.config/claude-code/credentials.json. Set a file path to
