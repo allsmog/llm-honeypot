@@ -16,6 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
+from cowrie.llm import cmd_parser
 from cowrie.llm import downloader
 from cowrie.llm.llm import LLMClient
 from cowrie.llm import persona as personamod
@@ -169,9 +170,62 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         if self._try_fastpath(string):
             return
+        # Parse the attacker's input for filesystem / env mutations and
+        # apply them to WorldState BEFORE the LLM call — so the next
+        # turn's system prompt already reflects the change. The LLM
+        # still narrates the command's terminal output; WorldState just
+        # keeps the picture consistent across turns.
+        self._apply_input_mutations(string)
         if self._try_download_intercept(string):
             return
         self._process_command_with_llm(string)
+
+    def _apply_input_mutations(self, command: str) -> None:
+        for m in cmd_parser.parse_input_mutations(command):
+            if m.kind == "create_file":
+                self.world.add_file(
+                    path=m.path or "",
+                    size_bytes=len((m.content or "").encode("utf-8")),
+                    sha256=None,
+                    source="created",
+                    content_snippet=(m.content or "")[:200],
+                )
+            elif m.kind == "append_file":
+                existing = self.world.files.get(m.path or "")
+                prev = (existing.content_snippet if existing else "") or ""
+                new_content = prev + (m.content or "")
+                self.world.add_file(
+                    path=m.path or "",
+                    size_bytes=len(new_content.encode("utf-8")),
+                    sha256=None,
+                    source="edited" if existing else "created",
+                    content_snippet=new_content[:200],
+                )
+            elif m.kind == "remove_file":
+                self.world.files.pop(m.path or "", None)
+            elif m.kind == "copy_file":
+                src = self.world.files.get(m.path or "")
+                if src and m.dst_path:
+                    self.world.add_file(
+                        path=m.dst_path,
+                        size_bytes=src.size_bytes,
+                        sha256=src.sha256,
+                        source="created",
+                        content_snippet=src.content_snippet,
+                    )
+            elif m.kind == "move_file":
+                src = self.world.files.pop(m.path or "", None)
+                if src and m.dst_path:
+                    self.world.add_file(
+                        path=m.dst_path,
+                        size_bytes=src.size_bytes,
+                        sha256=src.sha256,
+                        source=src.source,
+                        content_snippet=src.content_snippet,
+                    )
+            elif m.kind == "set_env":
+                if m.env_name:
+                    self.world.add_env(m.env_name, m.env_value or "")
 
     def _try_download_intercept(self, command: str) -> bool:
         """If the command is a wget/curl/tftp/ftpget, fetch first then

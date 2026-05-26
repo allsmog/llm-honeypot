@@ -90,9 +90,13 @@ class WorldState:
                 origin = (
                     f" from {f.source_url}" if f.source_url else f" ({f.source})"
                 )
-                lines.append(
-                    f"  {f.path}  size={f.size_bytes}  sha256={sha}{origin}"
-                )
+                line = f"  {f.path}  size={f.size_bytes}  sha256={sha}{origin}"
+                if f.content_snippet:
+                    # First 80 chars on the same line so the LLM picks
+                    # up the actual content when the attacker `cat`s it.
+                    snippet = f.content_snippet[:80].replace("\n", "\\n")
+                    line += f"  content={snippet!r}"
+                lines.append(line)
             if len(self.files) > self.MAX_FILES_IN_PROMPT:
                 lines.append(
                     f"  ... ({len(self.files) - self.MAX_FILES_IN_PROMPT} more, omitted)"
