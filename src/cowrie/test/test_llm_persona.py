@@ -26,6 +26,35 @@ class TestPickPersona(unittest.TestCase):
         seen = {pick_persona(f"10.0.0.{i}").slug for i in range(0, 50)}
         self.assertGreater(len(seen), 1)
 
+    def test_multi_source_ip_personas_diverge(self):
+        """End-to-end-ish: sample 10 plausibly-attacker IPs from across
+        the IPv4 space and assert we see at least 2 distinct personas.
+
+        Note: local SSH testing always uses 127.0.0.1, so the
+        persona-variation behavior only shows up in production where
+        the honeypot serves actual attackers from diverse IPs. This
+        test pins the *unit* of that behavior; live multi-IP testing
+        requires either lo aliasing or a containerized client per IP.
+        """
+        sample_ips = [
+            "203.0.113.45",   # TEST-NET-3
+            "198.51.100.7",   # TEST-NET-2
+            "192.0.2.123",    # TEST-NET-1
+            "8.8.8.8",        # Google DNS
+            "1.1.1.1",        # Cloudflare
+            "199.7.83.42",    # ICANN
+            "208.67.222.222", # OpenDNS
+            "9.9.9.9",        # Quad9
+            "64.6.64.6",      # Verisign
+            "84.200.69.80",   # DNS.WATCH
+        ]
+        slugs = {pick_persona(ip).slug for ip in sample_ips}
+        self.assertGreaterEqual(
+            len(slugs), 2,
+            f"Expected ≥2 distinct personas across {len(sample_ips)} IPs, "
+            f"got {len(slugs)}: {slugs!r}",
+        )
+
     def test_explicit_override_wins(self):
         p = pick_persona("203.0.113.45", override="alpine_3_19")
         self.assertEqual(p.slug, "alpine_3_19")
