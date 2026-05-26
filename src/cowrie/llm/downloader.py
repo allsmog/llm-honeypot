@@ -42,7 +42,7 @@ class DownloadIntent:
 
 # Tools whose first token signals a download. tftp/ftpget are recognized
 # but currently logged-only (no fetch). wget/curl drive real HTTP fetches.
-_DOWNLOAD_TOOLS = {"wget", "curl", "tftp", "ftpget"}
+_DOWNLOAD_TOOLS = {"wget", "curl", "tftp", "ftpget", "scp"}
 
 
 def _split_pipeline(line: str) -> str:
@@ -95,7 +95,48 @@ def parse_download_command(line: str) -> Optional[DownloadIntent]:
         return _parse_tftp(args, line)
     if tool == "ftpget":
         return _parse_ftpget(args, line)
+    if tool == "scp":
+        return _parse_scp(args, line)
     return None
+
+
+def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
+    """Detect `scp <src> <dst>`. Both directions caught.
+
+    Direction is encoded in the URL string:
+      scp://inbound/<remote-src>?dst=<local-dst>   — attacker pushes TO us
+      scp://outbound/<remote-dst>?src=<local-src>  — attacker pulls FROM us
+
+    v1 captures the intent only — no binary SCP protocol handling.
+    Actual inbound payload capture requires hooking the SSH channel
+    dispatcher, which lives below the LLM protocol layer and is a
+    tracked follow-up (see FORK.md).
+    """
+    # The last two positional args are src and dst. Skip flags.
+    positional = [a for a in args if not a.startswith("-")]
+    if len(positional) < 2:
+        return None
+    src, dst = positional[-2], positional[-1]
+    # Heuristic: user@host:path means a remote location.
+    src_remote = ":" in src and "/" not in src.split(":", 1)[0]
+    dst_remote = ":" in dst and "/" not in dst.split(":", 1)[0]
+    if src_remote and not dst_remote:
+        # Attacker is pulling FROM their host TO us. They want to push
+        # a payload onto the honeypot — the high-threat-intel direction.
+        direction = "inbound"
+    elif dst_remote and not src_remote:
+        # Attacker is pulling FROM us TO their host. Refuse-by-default
+        # because dialing their host with attacker creds makes us a
+        # credential tester.
+        direction = "outbound"
+    else:
+        direction = "ambiguous"
+    return DownloadIntent(
+        tool="scp",
+        url=f"scp://{direction}/{src}->{dst}",
+        outfile=dst if direction == "inbound" else src,
+        raw_command=raw,
+    )
 
 
 def _parse_wget(args: list[str], raw: str) -> Optional[DownloadIntent]:
@@ -319,10 +360,39 @@ def fetch(
         return _fetch_tftp(intent, log_event=log_event)
     if intent.tool == "ftpget":
         return _fetch_ftp(intent, log_event=log_event)
+    if intent.tool == "scp":
+        return _refuse_scp(intent, log_event=log_event)
     return defer.succeed(
         FetchResult(outcome="tool_unsupported", url=intent.url,
                     error_message=f"tool {intent.tool!r} not implemented")
     )
+
+
+def _refuse_scp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
+    """Log the scp intent and return a refused outcome.
+
+    v1 doesn't implement the SCP binary protocol — real inbound capture
+    requires hooking the SSH channel dispatcher (the LLM protocol layer
+    only sees exec command strings, not the per-channel scp wire format
+    that comes through after). For now, threat intel still captures the
+    direction + src/dst + raw command via cowrie.session.scp_attempt;
+    the LLM narrates a permission-denied or connection-closed message
+    consistent with the observation block.
+
+    See FORK.md "Known limitations" for the full follow-up scope.
+    """
+    log_event(
+        eventid="cowrie.session.scp_attempt",
+        url=intent.url,
+        outfile=intent.outfile,
+        raw=intent.raw_command,
+        format="scp attempt: %(raw)s",
+    )
+    return defer.succeed(FetchResult(
+        outcome="failed_blocked",
+        url=intent.url,
+        error_message="Permission denied (publickey,password).",
+    ))
 
 
 def _refuse_unimplemented(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:

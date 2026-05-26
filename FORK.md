@@ -163,6 +163,25 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
   Messages and Codex Responses/chat-completions), 401-retry, validate-
   config, parser, observation rendering, leak strip, WorldState, persona.
 
+## Known limitations
+
+- **scp payload capture is intent-only.** The downloader detects scp
+  commands, parses src/dst + direction (inbound vs outbound), and
+  logs `cowrie.session.scp_attempt` with the parsed fields — useful
+  for threat intel on who's trying to stage payloads. The actual SCP
+  binary protocol receiver isn't implemented in v1 because it lives
+  below the LLM protocol layer (per-channel SSH dispatch) and requires
+  a deeper refactor. Outbound scp stays refused-by-default to avoid
+  becoming an unintentional credential tester. The LLM narrates the
+  attempt as "Permission denied (publickey,password)." — consistent
+  with how a real locked-down sshd would respond.
+- **Streaming responses are off by default.** Anthropic providers
+  support it (`[llm] stream = true`); enabling it makes responses
+  drip to the terminal rather than appear in one block, which is
+  more realistic for `tail -f`-like commands. Trade-off: markdown
+  stripping + observation-leak redaction run at end-of-stream rather
+  than per chunk.
+
 ## Known security caveats
 
 - **DNS TOCTOU in the SSRF gate.** `cowrie.core.network.communication_allowed(host)`

