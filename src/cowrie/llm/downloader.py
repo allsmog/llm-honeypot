@@ -313,12 +313,12 @@ def fetch(
     if intent.tool in ("wget", "curl"):
         if intent.url.startswith(("http://", "https://")):
             return _fetch_http(intent, log_event=log_event)
-        # Bare-hostname (wget example.com) — _parse_wget normalized to http://.
-        # FTP via wget/curl is the same upstream as a plain ftp URL.
         if intent.url.startswith("ftp://"):
-            return _refuse_unimplemented(intent, log_event=log_event)
-    if intent.tool in ("tftp", "ftpget"):
-        return _refuse_unimplemented(intent, log_event=log_event)
+            return _fetch_ftp(intent, log_event=log_event)
+    if intent.tool == "tftp":
+        return _fetch_tftp(intent, log_event=log_event)
+    if intent.tool == "ftpget":
+        return _fetch_ftp(intent, log_event=log_event)
     return defer.succeed(
         FetchResult(outcome="tool_unsupported", url=intent.url,
                     error_message=f"tool {intent.tool!r} not implemented")
@@ -518,3 +518,241 @@ def _finish_http_exception(intent, log_event, url, failure, t0):
         error_message=err or "connection failed",
         duration_seconds=duration,
     )
+
+
+# ----------------------------------------------------------------------
+# TFTP
+
+
+def _size_cap_for_llm() -> int:
+    """Return the effective per-fetch byte cap for the LLM downloader.
+
+    Smaller of [honeypot] download_limit_size and [llm] download_limit_size_llm,
+    with 0 meaning unlimited on either side.
+    """
+    honeypot_cap = CowrieConfig.getint("honeypot", "download_limit_size", fallback=0)
+    llm_cap = CowrieConfig.getint("llm", "download_limit_size_llm", fallback=10485760)
+    if honeypot_cap and llm_cap:
+        return min(honeypot_cap, llm_cap)
+    return honeypot_cap or llm_cap
+
+
+def _fetch_tftp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
+    """Real TFTP fetch using cowrie.commands.tftp.TFTPClient.
+
+    The TFTPClient is the shell-backend's RFC 1350 client, protocol-
+    agnostic — we just listen on an ephemeral UDP port, dispatch it,
+    await its deferred, and convert the outcome to a FetchResult +
+    log event with the same shape as the HTTP path.
+    """
+    # Lazy-import to avoid pulling in HoneyPotCommand at module init.
+    from twisted.internet import reactor
+    from cowrie.commands.tftp import TFTPClient
+
+    url = intent.url
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    filename = (parsed.path or "").lstrip("/")
+    port = parsed.port or 69
+    if not host or not filename:
+        log_event(
+            eventid="cowrie.session.file_download.failed",
+            url=url, outfile=intent.outfile,
+            format="malformed tftp url %(url)s",
+        )
+        return defer.succeed(FetchResult(
+            outcome="failed_connection", url=url,
+            error_message="malformed TFTP URL",
+        ))
+
+    size_cap = _size_cap_for_llm()
+    t0 = time.time()
+
+    d_check: Deferred = defer.maybeDeferred(communication_allowed, host)
+
+    def on_allowed(allowed):
+        if not allowed:
+            log_event(
+                eventid="cowrie.session.file_download.failed",
+                url=url, outfile=intent.outfile,
+                format="tftp blocked by communication_allowed: %(url)s",
+            )
+            return FetchResult(
+                outcome="failed_blocked", url=url,
+                error_message=f"tftp: connect to {host} failed: Connection refused",
+            )
+
+        # Artifact creation deferred until after the SSRF check passes —
+        # avoid touching the download dir for every blocked request.
+        artifact = Artifact("llm-download")
+        client = TFTPClient(host=host, port=port, filename=filename, artifact=artifact)
+        udp_port = reactor.listenUDP(0, client)
+
+        def cleanup_and_finalize(result, was_success: bool, err_msg: str = ""):
+            try:
+                udp_port.stopListening()
+            except Exception:
+                pass
+            return _finalize_udp_or_ftp(
+                intent, log_event, url, artifact, size_cap, t0,
+                was_success=was_success, err_msg=err_msg,
+            )
+
+        d_fetch = client.deferred
+
+        def on_success(_):
+            return cleanup_and_finalize(_, was_success=True)
+
+        def on_failure(failure):
+            err = failure.getErrorMessage() if hasattr(failure, "getErrorMessage") else str(failure)
+            return cleanup_and_finalize(None, was_success=False, err_msg=err or "tftp failed")
+
+        d_fetch.addCallbacks(on_success, on_failure)
+        return d_fetch
+
+    d_check.addCallback(on_allowed)
+    return d_check
+
+
+def _finalize_udp_or_ftp(
+    intent, log_event, url, artifact, size_cap, t0,
+    *, was_success: bool, err_msg: str = "",
+):
+    """Shared finalizer for TFTP/FTP: close artifact, log, build FetchResult."""
+    bytes_dl = artifact.fp.tell()
+    if not was_success or bytes_dl == 0:
+        # Best effort to clean up the empty artifact; close() with
+        # default keepEmpty=False discards it.
+        try:
+            artifact.close()
+        except Exception:
+            pass
+        log_event(
+            eventid="cowrie.session.file_download.failed",
+            url=url, outfile=intent.outfile,
+            format="download failed: %(url)s",
+        )
+        return FetchResult(
+            outcome="failed_connection", url=url,
+            error_message=err_msg or "transfer failed",
+            duration_seconds=time.time() - t0,
+        )
+
+    outcome = "success"
+    if size_cap and bytes_dl > size_cap:
+        outcome = "partial"
+    closed = artifact.close()
+    sha = closed[0] if closed else None
+    saved = closed[1] if closed else None
+    log_event(
+        eventid="cowrie.session.file_download",
+        url=url, outfile=saved, shasum=sha,
+        format="Downloaded %(url)s with SHA-256 %(shasum)s to %(outfile)s",
+    )
+    return FetchResult(
+        outcome=outcome, url=url, saved_to=intent.outfile,
+        bytes_downloaded=bytes_dl, sha256=sha,
+        duration_seconds=time.time() - t0,
+    )
+
+
+# ----------------------------------------------------------------------
+# FTP
+
+
+def _fetch_ftp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
+    """Real FTP fetch using Twisted's FTPClient.
+
+    Mirrors the pattern at cowrie/commands/wget.py:300-393 and
+    cowrie/commands/ftpget.py. ClientCreator → FTPClient.connectFactory
+    → retrieveFile(remote, receiver). Receiver writes into an
+    Artifact, identical event shape to the HTTP and TFTP paths.
+    """
+    from twisted.internet import reactor
+    from twisted.internet.protocol import ClientCreator, Protocol
+    from twisted.protocols.ftp import FTPClient
+
+    url = intent.url
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or 21
+    path = parsed.path or "/"
+    user = parsed.username or "anonymous"
+    password = parsed.password or "honeypot@example.com"
+    if not host or not path or path == "/":
+        log_event(
+            eventid="cowrie.session.file_download.failed",
+            url=url, outfile=intent.outfile,
+            format="malformed ftp url %(url)s",
+        )
+        return defer.succeed(FetchResult(
+            outcome="failed_connection", url=url,
+            error_message="malformed FTP URL",
+        ))
+
+    size_cap = _size_cap_for_llm()
+    t0 = time.time()
+    d_check: Deferred = defer.maybeDeferred(communication_allowed, host)
+
+    def on_allowed(allowed):
+        if not allowed:
+            log_event(
+                eventid="cowrie.session.file_download.failed",
+                url=url, outfile=intent.outfile,
+                format="ftp blocked by communication_allowed: %(url)s",
+            )
+            return FetchResult(
+                outcome="failed_blocked", url=url,
+                error_message=f"ftp: connect to {host} refused",
+            )
+
+        # Artifact deferred until after the SSRF check passes — otherwise
+        # we'd touch the download dir for every blocked request.
+        artifact = Artifact("llm-download")
+
+        class _ArtifactReceiver(Protocol):
+            def dataReceived(self, data: bytes) -> None:
+                artifact.write(data)
+
+        creator = ClientCreator(reactor, FTPClient, user, password, passive=1)
+        d_conn = creator.connectTCP(host, port, timeout=10)
+
+        def on_connected(client):
+            d_retrieve = client.retrieveFile(path.lstrip("/"), _ArtifactReceiver())
+
+            def on_complete(_):
+                try:
+                    client.quit()
+                except Exception:
+                    pass
+                return _finalize_udp_or_ftp(
+                    intent, log_event, url, artifact, size_cap, t0,
+                    was_success=True,
+                )
+
+            def on_retrieve_failure(failure):
+                err = failure.getErrorMessage() if hasattr(failure, "getErrorMessage") else str(failure)
+                try:
+                    client.quit()
+                except Exception:
+                    pass
+                return _finalize_udp_or_ftp(
+                    intent, log_event, url, artifact, size_cap, t0,
+                    was_success=False, err_msg=err or "retrieve failed",
+                )
+
+            d_retrieve.addCallbacks(on_complete, on_retrieve_failure)
+            return d_retrieve
+
+        def on_connect_failure(failure):
+            err = failure.getErrorMessage() if hasattr(failure, "getErrorMessage") else str(failure)
+            return _finalize_udp_or_ftp(
+                intent, log_event, url, artifact, size_cap, t0,
+                was_success=False, err_msg=err or "connect failed",
+            )
+
+        d_conn.addCallbacks(on_connected, on_connect_failure)
+        return d_conn
+
+    d_check.addCallback(on_allowed)
+    return d_check

