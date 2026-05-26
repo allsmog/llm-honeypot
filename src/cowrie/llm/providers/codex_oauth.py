@@ -113,7 +113,7 @@ class CodexOAuthProvider(LLMProvider):
         }
         return body
 
-    def _parse_body(self, body: bytes) -> str:
+    def _parse_body(self, body: bytes, request) -> str:
         # Buffered SSE stream. Each event is a pair of lines:
         #   event: response.output_text.delta
         #   data: {"type":"response.output_text.delta","delta":"hello"}
@@ -139,6 +139,12 @@ class CodexOAuthProvider(LLMProvider):
                     text_chunks.append(delta)
             elif etype == "response.completed":
                 resp = event.get("response") or {}
+                # Capture token usage from the final SSE event. The
+                # Codex Responses API exposes input_tokens/output_tokens
+                # under response.usage.
+                from cowrie.llm.providers.base import _normalize_openai_usage
+                if isinstance(resp.get("usage"), dict):
+                    request.usage.update(_normalize_openai_usage(resp["usage"]))
                 if isinstance(resp.get("output_text"), str):
                     completed_text = resp["output_text"]
                 else:

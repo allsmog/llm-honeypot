@@ -428,20 +428,28 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         self._llm_t0 = time.time()
         d: defer.Deferred[str] = self.llm_client.generate(request)
-        d.addCallback(self._handle_llm_response)
+        # Closure carries the request so _handle_llm_response can attach
+        # the per-turn usage to the cowrie.llm.response event.
+        d.addCallback(lambda r, req=request: self._handle_llm_response(r, req))
         d.addErrback(self._handle_llm_error)
 
-    def _handle_llm_response(self, response: str) -> None:
+    def _handle_llm_response(self, response: str, request: LLMRequest = None) -> None:
         """
         Handle the response from the LLM and display it to the user.
         """
         latency_ms = int((time.time() - getattr(self, "_llm_t0", time.time())) * 1000)
+        usage = (request.usage if request else None) or {}
         log.msg(
             eventid="cowrie.llm.response",
             output=response,
             latency_ms=latency_ms,
+            tokens_in=usage.get("input_tokens", 0),
+            tokens_out=usage.get("output_tokens", 0),
+            tokens_cached=usage.get("cached_tokens", 0),
+            tokens_cache_creation=usage.get("cache_creation_tokens", 0),
+            tokens_total=usage.get("total_tokens", 0),
             sessionno=f"S{self.sessionno}",
-            format="LLM response in %(latency_ms)dms",
+            format="LLM response in %(latency_ms)dms (in=%(tokens_in)d out=%(tokens_out)d cached=%(tokens_cached)d)",
         )
 
         if self.terminal is None:
