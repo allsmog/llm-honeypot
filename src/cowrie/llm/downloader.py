@@ -361,6 +361,22 @@ def _fetch_http(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
 
+    # KNOWN RESIDUAL: DNS TOCTOU. communication_allowed(host) resolves
+    # via twisted's getHostByName, validates, returns True/False. treq.get
+    # then re-resolves to dial. If an attacker controls DNS for `host`
+    # and serves a public IP on the first lookup + 169.254.169.254 on
+    # the second, the fetch lands on AWS/GCP metadata instead of the
+    # vetted address. The bytes are captured into a local Artifact and
+    # are NEVER routed back to the attacker — the LLM narrates from
+    # WorldState metadata only — but the fetched content does sit on
+    # disk under var/lib/cowrie/downloads/. Compensating controls:
+    #   1. Don't deploy this honeypot on a host with privileged IAM.
+    #   2. download_path is gitignored; rotate / inspect the captured
+    #      artifacts before exposing the box to a broader audience.
+    #   3. Same TOCTOU exists in upstream cowrie.commands.wget — fixing
+    #      it requires custom Twisted Agent with SNI preservation for
+    #      HTTPS, which is non-trivial. Tracked as a follow-up.
+
     # Two caps: a Cowrie-wide [honeypot] download_limit_size and a tighter
     # llm-only cap. The smaller of the two wins (0 = unlimited on either).
     honeypot_cap = CowrieConfig.getint("honeypot", "download_limit_size", fallback=0)

@@ -163,6 +163,21 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
   Messages and Codex Responses/chat-completions), 401-retry, validate-
   config, parser, observation rendering, leak strip, WorldState, persona.
 
+## Known security caveats
+
+- **DNS TOCTOU in the SSRF gate.** `cowrie.core.network.communication_allowed(host)`
+  resolves DNS once, validates the IP, and returns. The subsequent `treq.get`
+  re-resolves to dial — between those two lookups, a malicious DNS could swap
+  the record to point at 169.254.169.254 (cloud metadata) or another blocked
+  range. Practical exposure is bounded: the fetched bytes are stored in a
+  local `Artifact` and never routed back to the attacker (the LLM narrates
+  from `WorldState` metadata only). The bytes do persist under
+  `var/lib/cowrie/downloads/` though, so don't deploy this honeypot on a
+  host with privileged IAM credentials, and rotate/inspect captures
+  regularly. Upstream Cowrie has the same TOCTOU; fixing it requires a
+  custom Twisted Agent with SNI preservation for HTTPS, which is a real
+  but tractable follow-up rather than a v1 blocker.
+
 ## Known limitations / TOS reminder
 
 - **OAuth providers consume session tokens** intended for the official
