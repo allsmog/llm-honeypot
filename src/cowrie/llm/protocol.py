@@ -19,6 +19,8 @@ from cowrie.core.config import CowrieConfig
 from cowrie.llm import downloader
 from cowrie.llm.llm import LLMClient
 from cowrie.llm import persona as personamod
+from cowrie.llm.providers.base import LLMMessage, LLMRequest
+from cowrie.llm.worldstate import WorldState
 
 
 def strip_markdown(text: str) -> str:
@@ -130,6 +132,11 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             self.persona, self.realClientIP
         )
 
+        # Per-session shadow state — files we really fetched, env vars
+        # the attacker has set, etc. Flows into the system prompt's
+        # mutable-tail segment so the LLM stays consistent across turns.
+        self.world = WorldState()
+
     def timeoutConnection(self) -> None:
         """
         this logs out when connection times out
@@ -181,6 +188,18 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             return False
 
         def on_result(result):
+            # Persist the captured file into WorldState so the next `ls
+            # /tmp` etc. from the LLM sees it. Only "real" outcomes
+            # (success / partial) add to the world; failures don't lie
+            # to the LLM about what's on disk.
+            if result.outcome in ("success", "partial") and intent.outfile:
+                self.world.add_file(
+                    path=intent.outfile,
+                    size_bytes=result.bytes_downloaded,
+                    sha256=result.sha256,
+                    source="downloaded",
+                    source_url=result.url,
+                )
             observation = downloader.render_observation(intent, result)
             self._process_command_with_llm(command, observation=observation)
 
@@ -369,24 +388,46 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             user_msg = f"{observation}\n{command}"
         self.command_history.append(f"User: {user_msg}")
 
-        system_context = self._build_system_context()
-        prompt = [system_context, *self.command_history[-10:]]
+        # Two-segment system prompt: a stable head (persona + base
+        # instructions) that gets prompt-cached on Anthropic, and a
+        # mutable tail (WorldState) that doesn't — so when the world
+        # mutates (e.g. a download lands) we only bust the small tail
+        # block, not the entire system prompt.
+        stable_head = self._build_system_context()
+        mutable_tail = self.world.to_prompt_section() if hasattr(self, "world") else ""
 
-        # Pass sessionno explicitly: the response callback below fires
-        # inside the Twisted HTTP client context, where the auto-detected
-        # 'system' prefix won't match Cowrie's SSH/Telnet regex, so events
-        # would silently be dropped by the output dispatcher.
+        # Reconstruct conversation messages from command_history (assistant
+        # turns prefixed "System:", user turns "User:").
+        request_messages: list[LLMMessage] = []
+        for raw in self.command_history[-10:]:
+            if raw.startswith("User:"):
+                request_messages.append(
+                    LLMMessage(role="user", content=raw[len("User:") :].strip())
+                )
+            elif raw.startswith("System:"):
+                request_messages.append(
+                    LLMMessage(role="assistant", content=raw[len("System:") :].strip())
+                )
+
+        request = LLMRequest(
+            system_blocks=[(stable_head, True), (mutable_tail, False)],
+            messages=request_messages,
+            max_tokens=self.llm_client.max_tokens,
+            temperature=self.llm_client.temperature,
+        )
+
         log.msg(
             eventid="cowrie.llm.prompt",
             input=command,
             cwd=self.cwd,
             history_depth=len(self.command_history),
+            world_files=len(self.world.files) if hasattr(self, "world") else 0,
             sessionno=f"S{self.sessionno}",
             format="LLM prompt: %(input)s",
         )
 
         self._llm_t0 = time.time()
-        d: defer.Deferred[str] = self.llm_client.get_response(prompt)
+        d: defer.Deferred[str] = self.llm_client.generate(request)
         d.addCallback(self._handle_llm_response)
         d.addErrback(self._handle_llm_error)
 

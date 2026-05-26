@@ -46,12 +46,21 @@ class LLMRequest:
     """Provider-agnostic request shape.
 
     Providers translate this into their own wire format.
+
+    ``system_blocks`` is an optional structured replacement for
+    ``system``: a list of ``(text, cacheable)`` pairs. Anthropic
+    providers honor it to split the system prompt across cache
+    breakpoints (stable persona = cached; mutable WorldState = not
+    cached, cheap to bust). Other providers concatenate the texts and
+    fall back to single-block behavior. If ``system_blocks`` is None
+    the provider uses the legacy ``system`` field.
     """
 
-    system: str
+    system: str = ""
     messages: list[LLMMessage] = field(default_factory=list)
     max_tokens: int = 500
     temperature: float = 0.7
+    system_blocks: list[tuple[str, bool]] | None = None
 
 
 @implementer(IBodyProducer)

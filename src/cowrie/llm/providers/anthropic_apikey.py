@@ -15,6 +15,37 @@ from twisted.web.http_headers import Headers
 from cowrie.llm.providers.base import LLMProvider, LLMRequest
 from cowrie.llm.providers.registry import ProviderRegistry
 
+
+def _build_anthropic_system(request: LLMRequest, *, cache_default: bool) -> Any:
+    """Anthropic system-prompt builder shared by both Anthropic providers.
+
+    Honors ``request.system_blocks`` (the two-segment shape: stable head
+    cached, mutable tail not cached) when provided; otherwise falls back
+    to the legacy single-block ``request.system``.
+
+    Returns either a string or a list-of-block dicts, matching the
+    Messages API's `system` field types.
+    """
+    if request.system_blocks:
+        blocks: list[dict[str, Any]] = []
+        for text, cacheable in request.system_blocks:
+            if not text:
+                continue
+            block: dict[str, Any] = {"type": "text", "text": text}
+            if cacheable:
+                block["cache_control"] = {"type": "ephemeral"}
+            blocks.append(block)
+        return blocks if blocks else ""
+    if cache_default and request.system:
+        return [
+            {
+                "type": "text",
+                "text": request.system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    return request.system
+
 if TYPE_CHECKING:
     from configparser import ConfigParser
 
@@ -61,17 +92,7 @@ class AnthropicAPIKeyProvider(LLMProvider):
         )
 
     def _format_body(self, request: LLMRequest) -> dict[str, Any]:
-        if self._cache_system and request.system:
-            system: Any = [
-                {
-                    "type": "text",
-                    "text": request.system,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-        else:
-            system = request.system
-
+        system = _build_anthropic_system(request, cache_default=self._cache_system)
         messages = [
             {"role": m.role, "content": m.content} for m in request.messages
         ] or [{"role": "user", "content": ""}]

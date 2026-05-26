@@ -81,8 +81,20 @@ class LLMClient:
             f"LLMClient initialized: provider={provider_name} model={self.provider.model}"
         )
 
+    def generate(self, request: LLMRequest) -> Deferred:
+        """Pass an LLMRequest straight through to the provider.
+
+        Used by the interactive protocol when it needs the two-segment
+        system_blocks shape for prompt caching. Returns Deferred[str].
+        """
+        return self.provider.generate(request)
+
     def get_response(self, prompt: list[str]) -> Deferred:
-        """Build an LLMRequest from Cowrie's prompt list and delegate.
+        """Legacy: build an LLMRequest from Cowrie's prompt list and delegate.
+
+        Kept for the exec-mode path (cowrie/llm/protocol.py's
+        HoneyPotExecProtocol), which is one-shot and doesn't benefit
+        from the two-segment cache split.
 
         Returns a Deferred[str]. On any provider-side error the Deferred
         fires with ``""``; the provider has already logged the failure.

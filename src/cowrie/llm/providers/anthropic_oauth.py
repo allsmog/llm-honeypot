@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from twisted.python import log
 from twisted.web.http_headers import Headers
 
+from cowrie.llm.providers.anthropic_apikey import _build_anthropic_system
 from cowrie.llm.providers.base import LLMProvider, LLMRequest
 from cowrie.llm.providers.registry import ProviderRegistry
 
@@ -161,17 +162,7 @@ class AnthropicOAuthProvider(LLMProvider):
         )
 
     def _format_body(self, request: LLMRequest) -> dict[str, Any]:
-        if self._cache_system and request.system:
-            system: Any = [
-                {
-                    "type": "text",
-                    "text": request.system,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-        else:
-            system = request.system
-
+        system = _build_anthropic_system(request, cache_default=self._cache_system)
         messages = [
             {"role": m.role, "content": m.content} for m in request.messages
         ] or [{"role": "user", "content": ""}]

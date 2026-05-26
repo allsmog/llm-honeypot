@@ -96,9 +96,15 @@ class CodexOAuthProvider(LLMProvider):
         # is rejected ("Unsupported parameter"), and the standard sampling
         # knobs aren't honored either. We pass only what's accepted; honeypot
         # responses are short by nature so token-cap loss is acceptable.
+        # Responses API takes a single `instructions` string. Concatenate
+        # any system_blocks (the cache-segmented shape Anthropic uses) —
+        # we lose the cache breakpoint signal but keep the content.
+        instructions = request.system
+        if request.system_blocks:
+            instructions = "\n\n".join(t for t, _ in request.system_blocks if t)
         body: dict[str, Any] = {
             "model": self._model,
-            "instructions": request.system or "",
+            "instructions": instructions or "",
             "input": [
                 {"role": m.role, "content": m.content} for m in request.messages
             ] or [{"role": "user", "content": ""}],

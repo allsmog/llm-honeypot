@@ -56,9 +56,16 @@ class CodexAPIKeyProvider(LLMProvider):
         )
 
     def _format_body(self, request: LLMRequest) -> dict[str, Any]:
+        # OpenAI chat-completions doesn't support per-block cache
+        # breakpoints (its automatic prompt caching kicks in at >=1024
+        # tokens regardless), so concatenate any system_blocks back
+        # into a single system message.
+        system_text = request.system
+        if request.system_blocks:
+            system_text = "\n\n".join(t for t, _ in request.system_blocks if t)
         messages: list[dict[str, str]] = []
-        if request.system:
-            messages.append({"role": "system", "content": request.system})
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
         messages.extend({"role": m.role, "content": m.content} for m in request.messages)
         return {
             "model": self._model,
