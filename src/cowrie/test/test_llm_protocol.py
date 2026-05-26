@@ -1,0 +1,320 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Protocol-layer unit tests for the LLM honeypot.
+
+Covers behavior that lives in cowrie/llm/protocol.py: fastpath dispatch
+for trivial commands, command-cap enforcement, persona + WorldState
+initialization at connectionMade, observation block injection from the
+download interceptor, and the marker-leak guard.
+
+Uses the FakeAvatar / FakeServer / FakeTransport fixtures shared with
+the shell backend tests, plus a per-test StubLLMClient that returns
+canned responses synchronously so we don't need a reactor.
+"""
+
+from __future__ import annotations
+
+import time
+
+from twisted.internet import defer
+from twisted.trial import unittest
+
+from cowrie.llm import downloader as downloader_mod
+from cowrie.llm.protocol import HoneyPotInteractiveProtocol
+from cowrie.llm.providers.base import LLMRequest
+from cowrie.test.fake_server import FakeAvatar, FakeServer
+from cowrie.test.fake_transport import FakeTransport
+
+
+# ----------------------------------------------------------------------
+# Stubs
+
+
+class StubLLMClient:
+    """Minimal LLMClient surface: generate() / get_response() / max_tokens / temperature."""
+
+    def __init__(self, response: str = "ok\n"):
+        self.response = response
+        self.calls: list[LLMRequest] = []
+        self.max_tokens = 500
+        self.temperature = 0.7
+
+    def generate(self, request: LLMRequest) -> defer.Deferred:
+        self.calls.append(request)
+        return defer.succeed(self.response)
+
+    def get_response(self, prompt: list[str]) -> defer.Deferred:
+        # legacy path, not exercised by the interactive protocol
+        return defer.succeed(self.response)
+
+
+class _LLMFakeServer(FakeServer):
+    """FakeServer that exposes the stub llm_client the protocol expects
+    to find on `self.user.server.llm_client`."""
+
+    def __init__(self, llm_client: StubLLMClient):
+        super().__init__()
+        self.llm_client = llm_client
+
+
+def _safe_cancel_timeout(proto: HoneyPotInteractiveProtocol) -> None:
+    try:
+        proto.setTimeout(None)
+    except Exception:
+        pass
+
+
+def _make_protocol(
+    *, llm_response: str = "ok\n", source_ip: str = "203.0.113.45",
+) -> tuple[HoneyPotInteractiveProtocol, FakeTransport, StubLLMClient]:
+    stub = StubLLMClient(response=llm_response)
+    avatar = FakeAvatar(_LLMFakeServer(stub))
+    proto = HoneyPotInteractiveProtocol(avatar)
+    tr = FakeTransport("", "31337")
+    proto.makeConnection(tr)
+    # Override the realClientIP that connectionMade picked off the
+    # FakeTransport's peer — we want deterministic persona selection
+    # in the tests.
+    proto.realClientIP = source_ip
+    tr.clear()
+    return proto, tr, stub
+
+
+# ----------------------------------------------------------------------
+# Fastpath
+
+
+class TestFastpath(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+
+    def tearDown(self) -> None:
+        # HoneyPotBaseProtocol.connectionMade arms a TimeoutMixin delayed
+        # call; cancel it directly so Trial's reactor-cleanliness check
+        # doesn't fail. connectionLost would do this too but throws on
+        # the FakeTransport's missing terminal.transport.processEnded.
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_pwd_returns_cwd_without_llm(self):
+        self.proto.cwd = "/var/log"
+        self.proto.lineReceived(b"pwd")
+        self.assertIn(b"/var/log", self.tr.value())
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_cd_absolute_updates_cwd(self):
+        self.proto.lineReceived(b"cd /etc")
+        self.assertEqual(self.proto.cwd, "/etc")
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_cd_tilde_root_goes_to_root_home(self):
+        self.proto.lineReceived(b"cd ~")
+        self.assertEqual(self.proto.cwd, "/root")
+
+    def test_cd_dotdot_goes_up(self):
+        self.proto.cwd = "/var/log"
+        self.proto.lineReceived(b"cd ..")
+        self.assertEqual(self.proto.cwd, "/var")
+
+    def test_cd_dash_swaps_to_prev(self):
+        self.proto.cwd = "/var/log"
+        self.proto.lineReceived(b"cd /tmp")
+        self.proto.lineReceived(b"cd -")
+        self.assertEqual(self.proto.cwd, "/var/log")
+
+    def test_cd_relative_path_appends(self):
+        self.proto.cwd = "/var"
+        self.proto.lineReceived(b"cd log")
+        self.assertEqual(self.proto.cwd, "/var/log")
+
+    def test_empty_input_does_not_call_llm(self):
+        self.proto.lineReceived(b"")
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_clear_invokes_eraseDisplay(self):
+        # FakeTransport doesn't implement cursorHome (the real Twisted
+        # insults terminal does). Stub it so the fastpath can complete.
+        self.tr.cursorHome = lambda: None
+        self.proto.lineReceived(b"clear")
+        self.assertEqual(len(self.stub.calls), 0)
+
+    def test_exit_does_not_call_llm(self):
+        # FakeTransport.loseConnection is a noop on StringTransport but
+        # the important thing is that the LLM isn't consulted for exit.
+        try:
+            self.proto.lineReceived(b"exit")
+        except Exception:
+            pass
+        self.assertEqual(len(self.stub.calls), 0)
+
+
+# ----------------------------------------------------------------------
+# Command cap
+
+
+class TestCommandCap(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+        # Override the cap via the CowrieConfig the protocol reads at
+        # each turn. The actual config is global, so monkeypatch the
+        # protocol method to inject a low cap.
+        from cowrie.core.config import CowrieConfig
+        # Ensure the [llm] section exists, then set a tight cap.
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        self._orig_cap = CowrieConfig.get(
+            "llm", "max_commands_per_session", fallback=None
+        )
+        CowrieConfig.set("llm", "max_commands_per_session", "3")
+        self.addCleanup(self._restore_cap)
+
+    def _restore_cap(self):
+        from cowrie.core.config import CowrieConfig
+        if self._orig_cap is None:
+            CowrieConfig.remove_option("llm", "max_commands_per_session")
+        else:
+            CowrieConfig.set("llm", "max_commands_per_session", self._orig_cap)
+
+    def tearDown(self) -> None:
+        # HoneyPotBaseProtocol.connectionMade arms a TimeoutMixin delayed
+        # call; cancel it directly so Trial's reactor-cleanliness check
+        # doesn't fail. connectionLost would do this too but throws on
+        # the FakeTransport's missing terminal.transport.processEnded.
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_cap_stops_llm_calls_after_threshold(self):
+        # 5 LLM-bound commands with cap=3 → provider stub should be
+        # called 3 times and the 4th/5th get the canned fork error.
+        for _ in range(5):
+            self.proto.lineReceived(b"whoami")
+        self.assertEqual(len(self.stub.calls), 3)
+        # The 4th and 5th commands should have written the fork error.
+        self.assertIn(b"cannot fork", self.tr.value())
+
+    def test_fastpath_commands_do_not_consume_budget(self):
+        # 3 LLM commands fill the budget; then 2 fastpath calls should
+        # still complete normally without triggering the cap.
+        for _ in range(3):
+            self.proto.lineReceived(b"whoami")
+        self.assertEqual(len(self.stub.calls), 3)
+        self.proto.lineReceived(b"pwd")
+        self.proto.lineReceived(b"cd /tmp")
+        self.assertEqual(len(self.stub.calls), 3)  # unchanged
+
+
+# ----------------------------------------------------------------------
+# Persona + WorldState init
+
+
+class TestSessionInit(unittest.TestCase):
+
+    def _make_and_clean(self, **kw):
+        proto, tr, stub = _make_protocol(**kw)
+        self.addCleanup(lambda: _safe_cancel_timeout(proto))
+        return proto, tr, stub
+
+    def test_persona_assigned_at_connectionMade(self):
+        proto, _, _ = self._make_and_clean(source_ip="203.0.113.45")
+        self.assertTrue(hasattr(proto, "persona"))
+        # boot_time must be in the persona's uptime range.
+        lo, hi = proto.persona.uptime_days_range
+        uptime_days = (time.time() - proto.boot_time) / 86400
+        self.assertGreaterEqual(uptime_days, lo)
+        self.assertLessEqual(uptime_days, hi + 1)
+
+    def test_same_ip_same_persona(self):
+        a, _, _ = self._make_and_clean(source_ip="198.51.100.1")
+        b, _, _ = self._make_and_clean(source_ip="198.51.100.1")
+        self.assertIs(a.persona, b.persona)
+
+    def test_worldstate_initialized_empty(self):
+        proto, _, _ = self._make_and_clean()
+        self.assertTrue(hasattr(proto, "world"))
+        self.assertEqual(proto.world.files, {})
+
+
+# ----------------------------------------------------------------------
+# Observation block injection from the download interceptor
+
+
+class TestObservationInjection(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol(
+            llm_response="downloaded ok\n",
+        )
+
+    def tearDown(self) -> None:
+        # HoneyPotBaseProtocol.connectionMade arms a TimeoutMixin delayed
+        # call; cancel it directly so Trial's reactor-cleanliness check
+        # doesn't fail. connectionLost would do this too but throws on
+        # the FakeTransport's missing terminal.transport.processEnded.
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_download_intercept_injects_observation_into_llm_prompt(self):
+        # Stub the downloader so we don't actually fetch anything.
+        intent = downloader_mod.DownloadIntent(
+            tool="wget",
+            url="http://example.test/x",
+            outfile="/tmp/x",
+            raw_command="wget http://example.test/x -O /tmp/x",
+        )
+        result = downloader_mod.FetchResult(
+            outcome="success",
+            url="http://example.test/x",
+            saved_to="/tmp/x",
+            bytes_downloaded=42,
+            sha256="abc1234567890def",
+            http_status=200,
+            content_type="text/plain",
+            duration_seconds=0.1,
+        )
+
+        self.patch(downloader_mod, "parse_download_command",
+                   lambda line: intent)
+        self.patch(downloader_mod, "fetch",
+                   lambda i, *, log_event: defer.succeed(result))
+
+        self.proto.lineReceived(b"wget http://example.test/x -O /tmp/x")
+
+        # The LLM was called once with the observation block injected.
+        self.assertEqual(len(self.stub.calls), 1)
+        req = self.stub.calls[0]
+        user_msg = req.messages[-1].content
+        self.assertIn("[SHELL_OBSERVED]", user_msg)
+        self.assertIn("sha256: abc1234567890def", user_msg)
+        self.assertIn("bytes_downloaded: 42", user_msg)
+        # And the WorldState picked up the file.
+        self.assertIn("/tmp/x", self.proto.world.files)
+
+
+# ----------------------------------------------------------------------
+# Marker-leak guard
+
+
+class TestObservationLeakStrip(unittest.TestCase):
+
+    def test_leaked_marker_stripped_from_terminal_output(self):
+        leaky = (
+            "before\n"
+            "[SHELL_OBSERVED]\nsensitive\n[/SHELL_OBSERVED]\n"
+            "after"
+        )
+        proto, tr, _ = _make_protocol(llm_response=leaky)
+        self.addCleanup(lambda: _safe_cancel_timeout(proto))
+        # Drive any command that hits the LLM path.
+        proto.lineReceived(b"whoami")
+        rendered = tr.value().decode("utf-8", errors="replace")
+        self.assertNotIn("[SHELL_OBSERVED]", rendered)
+        self.assertNotIn("[/SHELL_OBSERVED]", rendered)
+        self.assertNotIn("sensitive", rendered)
