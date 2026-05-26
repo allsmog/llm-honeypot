@@ -435,6 +435,13 @@ log_raw = false
 # (default: true; only applies to anthropic_* providers)
 #anthropic_cache_system = true
 
+# Maximum LLM-bound commands per session before the honeypot degrades to
+# a static "bash: cannot fork: Resource temporarily unavailable" response.
+# Caps cost when an attacker spams commands. Fastpath commands (cd, pwd,
+# exit, clear) don't count toward the budget.
+# (default: 200)
+#max_commands_per_session = 200
+
 # Maximum tokens in the response.
 # (default: 500)
 #max_tokens = 500

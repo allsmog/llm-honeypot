@@ -51,6 +51,10 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         self.cwd = "/"
         self.data = None
         self.password_input = False
+        # Cost cap: track how many commands have hit the LLM in this session.
+        # Fastpath commands (cd, pwd, exit, clear) don't count.
+        self._command_count = 0
+        self._budget_exhausted_logged = False
 
     def getProtoTransport(self):
         """
@@ -258,6 +262,32 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         Process a command by sending it to the LLM and writing the response
         to the terminal.
         """
+        # Cost cap. An attacker spamming `for i in $(seq 1 10000); do ls; done`
+        # would otherwise run up unbounded API spend. After the cap, return
+        # a plausible resource-exhaustion line and skip the LLM entirely —
+        # closing the connection abruptly is a more obvious fingerprint than
+        # a real Linux box that's run out of file descriptors.
+        max_cmds = CowrieConfig.getint(
+            "llm", "max_commands_per_session", fallback=200
+        )
+        self._command_count += 1
+        if self._command_count > max_cmds:
+            if not self._budget_exhausted_logged:
+                log.msg(
+                    eventid="cowrie.llm.session_budget_exhausted",
+                    count=self._command_count,
+                    cap=max_cmds,
+                    sessionno=f"S{self.sessionno}",
+                    format="LLM budget exhausted: %(count)d > %(cap)d",
+                )
+                self._budget_exhausted_logged = True
+            if self.terminal is not None:
+                self.terminal.write(
+                    b"bash: cannot fork: Resource temporarily unavailable\n"
+                )
+            self._show_prompt()
+            return
+
         if not hasattr(self, "llm_client"):
             self.llm_client = LLMClient()
             self.command_history = []
