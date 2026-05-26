@@ -28,3 +28,14 @@ _trial_temp
 .idea/
 .tox
 .coverage
+
+# llm-honeypot fork additions
+var/lib/cowrie/
+var/run/
+etc/cowrie.cfg
+etc/ssh_host_ecdsa_key
+etc/ssh_host_ecdsa_key.pub
+etc/ssh_host_ed25519_key
+etc/ssh_host_ed25519_key.pub
+scripts/llm_smoke.py
+scripts/llm_smoke_*.log
