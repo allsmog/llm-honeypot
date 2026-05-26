@@ -441,6 +441,14 @@ log_raw = false
 # (default: true; only applies to anthropic_* providers)
 #anthropic_cache_system = true
 
+# Latency anti-fingerprinting: real bash responds in 1-10ms while the
+# LLM path takes 500-2000ms. The fastpath (cd/pwd/clear/empty) would
+# otherwise return instantly — a fingerprint. Add random jitter to
+# fastpath responses so the fast/slow timing distributions overlap.
+# (defaults: min=5, max=15 — set both to 0 to disable)
+#fastpath_jitter_ms_min = 5
+#fastpath_jitter_ms_max = 15
+
 # Intercept wget/curl/tftp/ftpget commands and actually fetch the URL
 # (HTTP/HTTPS only for now) before sending the command to the LLM.
 # Capture lands under [honeypot] download_path with a SHA-256 filename,

@@ -64,9 +64,25 @@ def _safe_cancel_timeout(proto: HoneyPotInteractiveProtocol) -> None:
         pass
 
 
+def _disable_fastpath_jitter():
+    """Set fastpath_jitter_ms_{min,max} to 0 in CowrieConfig.
+
+    Production defaults to 5-15ms via reactor.callLater. That schedules a
+    delayed call that Trial's reactor-cleanliness check rejects unless we
+    explicitly cancel it. Disabling jitter at the config level makes the
+    tests synchronous without per-test bookkeeping.
+    """
+    from cowrie.core.config import CowrieConfig
+    if not CowrieConfig.has_section("llm"):
+        CowrieConfig.add_section("llm")
+    CowrieConfig.set("llm", "fastpath_jitter_ms_min", "0")
+    CowrieConfig.set("llm", "fastpath_jitter_ms_max", "0")
+
+
 def _make_protocol(
     *, llm_response: str = "ok\n", source_ip: str = "203.0.113.45",
 ) -> tuple[HoneyPotInteractiveProtocol, FakeTransport, StubLLMClient]:
+    _disable_fastpath_jitter()
     stub = StubLLMClient(response=llm_response)
     avatar = FakeAvatar(_LLMFakeServer(stub))
     proto = HoneyPotInteractiveProtocol(avatar)
@@ -140,6 +156,21 @@ class TestFastpath(unittest.TestCase):
         self.tr.cursorHome = lambda: None
         self.proto.lineReceived(b"clear")
         self.assertEqual(len(self.stub.calls), 0)
+
+    def test_show_prompt_defers_when_jitter_configured(self):
+        """When jitter > 0, the prompt write must be deferred via
+        reactor.callLater rather than synchronous. Verifies the
+        anti-fingerprinting jitter is wired correctly."""
+        from twisted.internet import reactor as _reactor, task
+        clock = task.Clock()
+        self.patch(_reactor, "callLater", clock.callLater)
+        self.tr.clear()
+        self.proto._show_prompt(jitter_min_ms=10, jitter_max_ms=10)
+        # Prompt should NOT have been written yet (it's queued).
+        self.assertEqual(self.tr.value(), b"")
+        clock.advance(0.020)
+        # Now the prompt should be there. FakeServer's hostname is "unitTest".
+        self.assertIn(b"@unitTest", self.tr.value())
 
     def test_exit_does_not_call_llm(self):
         # FakeTransport.loseConnection is a noop on StringTransport but

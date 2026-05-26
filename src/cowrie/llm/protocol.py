@@ -227,8 +227,12 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         turn sees consistent state. Per-LLM latency for these is wasted.
         """
         stripped = command.strip()
+        # Fastpath jitter: real bash takes a few ms even on trivial
+        # commands. Returning in <1ms is a fingerprint; add 5-15ms.
+        jitter_min = CowrieConfig.getint("llm", "fastpath_jitter_ms_min", fallback=5)
+        jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
         if not stripped:
-            self._show_prompt()
+            self._show_prompt(jitter_min, jitter_max)
             return True
 
         parts = stripped.split(None, 1)
@@ -244,22 +248,22 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             if self.terminal is not None:
                 self.terminal.eraseDisplay()
                 self.terminal.cursorHome()
-            self._show_prompt()
+            self._show_prompt(jitter_min, jitter_max)
             return True
 
         if head == "pwd":
             if self.terminal is not None:
                 self.terminal.write(f"{self.cwd}\n".encode())
-            self._show_prompt()
+            self._show_prompt(jitter_min, jitter_max)
             return True
 
         if head == "cd":
-            self._handle_cd(rest.strip())
+            self._handle_cd(rest.strip(), jitter_min, jitter_max)
             return True
 
         return False
 
-    def _handle_cd(self, arg: str) -> None:
+    def _handle_cd(self, arg: str, jitter_min_ms: int = 0, jitter_max_ms: int = 0) -> None:
         """Resolve ``cd <arg>`` against ``self.cwd`` and update it in place.
 
         We have no real filesystem, so any path is accepted. The LLM will
@@ -284,7 +288,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         new_cwd = new_cwd.rstrip("/") or "/"
         self._prev_cwd = self.cwd
         self.cwd = new_cwd
-        self._show_prompt()
+        self._show_prompt(jitter_min_ms, jitter_max_ms)
 
     def _build_system_context(self, exec_command: str = "") -> str:
         """
@@ -490,16 +494,36 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # Show nothing - just the prompt, as if the command produced no output
         self._show_prompt()
 
-    def _show_prompt(self):
+    def _show_prompt(self, jitter_min_ms: int = 0, jitter_max_ms: int = 0):
+        """Display the appropriate command prompt to the user.
+
+        ``jitter_min_ms`` / ``jitter_max_ms`` apply latency anti-
+        fingerprinting jitter — fastpath commands (cd/pwd/exit/clear)
+        normally return in <1ms but real bash takes a few ms. Adding
+        small random jitter makes the fast/slow timing distributions
+        overlap so attackers can't fingerprint via timing alone.
+
+        Zero values (the default) make this a no-op for the LLM-path
+        callers, which are already slow.
         """
-        Display the appropriate command prompt to the user.
-        """
-        # Build a realistic prompt
+        max_jitter = max(0, jitter_max_ms)
+        min_jitter = max(0, min(jitter_min_ms, max_jitter))
+        if max_jitter > 0:
+            from twisted.internet import reactor
+            import random
+            delay_ms = random.randint(min_jitter, max_jitter)
+            reactor.callLater(delay_ms / 1000.0, self._write_prompt_safe)
+            return
+        self._write_prompt_safe()
+
+    def _write_prompt_safe(self) -> None:
+        """Write the prompt unless the terminal is gone (post-disconnect)."""
+        if self.terminal is None:
+            return
         if self.user.username == "root":
             prompt = f"{self.user.username}@{self.hostname}:{self.cwd}# "
         else:
             prompt = f"{self.user.username}@{self.hostname}:{self.cwd}$ "
-
         self.terminal.write(prompt.encode("utf-8"))
 
     def uptime(self):
