@@ -114,18 +114,69 @@ codex_oauth_token_file = ~/.codex/auth.json
 
 That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
-## Things still on the list
+## What the fork adds beyond the provider abstraction
 
-- **Per-session world state**: today the LLM only sees the last 10 commands.
-  Richer state (consistent fake users / files / cwd-aware fs view) would cut
-  contradictions on long sessions.
-- **Fastpath for trivial commands**: `pwd`, `cd`, `exit` shouldn't pay LLM
-  latency. Hand them to a static handler before the LLM sees them.
-- **LLM-turn logging**: capture every prompt+response into the JSON event
-  log alongside the attacker command, for offline analysis.
+- **Fastpath for trivial commands.** `exit`/`logout`/`quit`, `cd`, `pwd`,
+  `clear`, and empty input are handled in `lineReceived` without an LLM
+  round-trip. `exit` actually exits, `cd` updates `self.cwd` so the next
+  LLM turn sees consistent state. Cuts per-session latency and cost.
+- **LLM-turn logging.** Every command emits `cowrie.llm.prompt` and
+  `cowrie.llm.response` events to the JSON log with `latency_ms`. Errors
+  log `cowrie.llm.error`. All carry the session id so they correlate with
+  the connect / command / login event stream.
+- **Per-session command cap.** `[llm] max_commands_per_session` (default
+  200) bounds API spend. After the cap, attackers see a canned
+  `bash: cannot fork: Resource temporarily unavailable` line — plausible
+  Linux behavior, less of a fingerprint than abrupt disconnect.
+- **Fail-fast config validation.** Misconfigured `[llm]` (e.g. selected
+  `anthropic_apikey` with no key) makes `cowrie start` exit non-zero
+  with a clear error before the SSH listener binds. No more half-broken
+  honeypots that fail silently per-connection.
+- **OAuth token reload on 401.** When Claude Code or Codex CLI rotates
+  the credential file, the provider re-reads on the first 401 and
+  retries once. Same-token reloads don't retry (no infinite loop).
+- **Persona pinning.** `[llm] persona = auto` picks one of six
+  believable Linux profiles (Ubuntu 22.04/20.04, Debian 12/11, CentOS 7,
+  Alpine 3.19), keyed deterministically off the attacker's source IP.
+  Distro, kernel, /proc/cpuinfo model, memtotal, uptime range, package
+  list all pinned in the system prompt — `uname -a`, `cat /etc/os-release`,
+  `uptime`, `free`, `/proc/cpuinfo` stay consistent across turns.
+- **Real payload capture.** `wget`/`curl` are intercepted before the
+  LLM; the actual file is fetched via `treq`, persisted under
+  `[honeypot] download_path` with a SHA-256 filename, and logged as
+  `cowrie.session.file_download` (same event shape as upstream's shell
+  backend). SSRF is gated by `cowrie.core.network.communication_allowed`
+  — AWS/GCP metadata (169.254.169.254), RFC1918, loopback all blocked.
+  A `[SHELL_OBSERVED]` block carrying the real bytes/sha/url/status is
+  injected into the next LLM turn so its narration matches reality.
+  `tftp` / `ftpget` are parsed and their URLs logged but not yet fetched.
+- **Per-session WorldState.** Files actually downloaded persist into a
+  WorldState object that flows into the system prompt's mutable-tail
+  segment. Multi-turn consistency: `curl -o /tmp/x ...` then `ls /tmp`
+  then `wc -c /tmp/x` all report the real size and content type.
+- **Two-segment Anthropic prompt caching.** The persona block (stable
+  for the session) gets `cache_control: ephemeral`; the WorldState block
+  doesn't. Cache hit rate stays high even when the world mutates,
+  keeping per-turn latency low (~80–150ms hit vs ~300–500ms cold).
+- **Tests.** 50 Twisted Trial tests under `cowrie/test/test_llm_*.py`
+  covering provider registration, body framing per provider (Anthropic
+  Messages and Codex Responses/chat-completions), 401-retry, validate-
+  config, parser, observation rendering, leak strip, WorldState, persona.
 
-These are the obvious next moves — file an issue or just yell at me to
-pick one up.
+## Known limitations / TOS reminder
+
+- **OAuth providers consume session tokens** intended for the official
+  Claude Code / Codex CLIs. For personal / research deployments to an
+  unrouteable IP this is fine. For wide-net public honeypot sensors,
+  use the API-key providers (`anthropic_apikey` / `codex_apikey`) —
+  Anthropic and OpenAI ToS restrict programmatic use of subscription
+  session tokens.
+- **Streaming responses** for `tail -f` / `top` are not implemented.
+  Upstream Cowrie's shell backend doesn't stream either, so this is
+  not a regression vs upstream — flag for a future iteration.
+- **scp payload capture** is deliberately cut. Fetching from a third-
+  party host with the attacker's credentials is operationally risky
+  enough that v1 leaves scp to the LLM's narration.
 
 ## License
 
