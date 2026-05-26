@@ -187,6 +187,14 @@ class AnthropicOAuthProvider(LLMProvider):
                 return block.get("text", "")
         return ""
 
+    def _supports_streaming(self) -> bool:
+        return True
+
+    def _format_streaming_body(self, request) -> dict:
+        body = self._format_body(request)
+        body["stream"] = True
+        return body
+
     @classmethod
     def validate_config(cls, config) -> list[str]:
         # Either an explicit token file exists, or on macOS the keychain

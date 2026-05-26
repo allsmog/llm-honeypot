@@ -228,6 +228,81 @@ class LLMProvider(ABC):
         """
         return self._generate(request, retried=False)
 
+    # Hook: providers that support streaming override _format_streaming_body
+    # to set stream:true on the wire and override _supports_streaming to
+    # return True. The protocol layer opts in via [llm] stream = true.
+    def _supports_streaming(self) -> bool:
+        return False
+
+    def generate_streaming(
+        self, request: LLMRequest, on_chunk: "Callable[[str], None]",
+    ) -> Deferred:
+        """Stream the response, calling on_chunk(text) for each delta.
+
+        Returns Deferred[str] of the full accumulated text — same
+        contract as generate() so callers can treat it interchangeably.
+        Providers that don't support streaming raise via the deferred;
+        the protocol layer falls back to generate() in that case.
+        """
+        from cowrie.llm.providers.streaming import make_streaming_consumer
+
+        if not self._supports_streaming():
+            return defer.fail(RuntimeError(
+                f"provider {self.name!r} does not support streaming"
+            ))
+
+        body = self._format_streaming_body(request)
+        if self.debug:
+            log.msg(f"LLM[{self.name}] stream request: {json.dumps(body, indent=2)}")
+
+        d: Deferred = self.agent.request(
+            b"POST",
+            self.endpoint.encode("utf-8"),
+            headers=self._build_headers(),
+            bodyProducer=_StringProducer(json.dumps(body)),
+        )
+
+        def on_response(resp):
+            if resp.code != 200:
+                # Non-200: collect the error body the regular way then
+                # return empty string so the session keeps going.
+                d_body: Deferred = defer.Deferred()
+                resp.deliverBody(_BodyCollector(resp.code, d_body))
+
+                def on_body(result):
+                    status, body = result
+                    log.err(
+                        f"LLM[{self.name}] stream HTTP {status}: "
+                        f"{body[:300].decode('utf-8', errors='replace')}"
+                    )
+                    return ""
+
+                d_body.addCallback(on_body)
+                return d_body
+            consumer, completion = make_streaming_consumer(resp.code, on_chunk)
+            resp.deliverBody(consumer)
+
+            def on_stream_done(result):
+                text, usage = result
+                if isinstance(usage, dict):
+                    request.usage.update(_normalize_anthropic_usage(usage))
+                return text
+
+            completion.addCallback(on_stream_done)
+            return completion
+
+        def on_request_failure(failure):
+            log.err(f"LLM[{self.name}] streaming request failed: {failure.getErrorMessage()}")
+            return ""
+
+        d.addCallbacks(on_response, on_request_failure)
+        return d
+
+    def _format_streaming_body(self, request: LLMRequest) -> dict:
+        """Default: same as _format_body. Anthropic providers override
+        to also set ``stream: true``."""
+        return self._format_body(request)
+
     def _generate(self, request: LLMRequest, retried: bool) -> Deferred:
         body = self._format_body(request)
         if self.debug:

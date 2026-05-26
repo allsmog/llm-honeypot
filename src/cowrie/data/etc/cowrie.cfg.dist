@@ -441,6 +441,15 @@ log_raw = false
 # (default: true; only applies to anthropic_* providers)
 #anthropic_cache_system = true
 
+# Stream LLM responses to the terminal as they arrive (Anthropic
+# Messages API stream:true) instead of buffering the full response.
+# Closer to real interactive-shell behavior for commands like
+# `tail -f` or `cat large-file` where output drips in.
+# Trade-off: markdown stripping + observation-leak redaction happen
+# at end-of-stream rather than per chunk. Off by default.
+# (default: false; only honored by anthropic_apikey / anthropic_oauth)
+#stream = false
+
 # Latency anti-fingerprinting: real bash responds in 1-10ms while the
 # LLM path takes 500-2000ms. The fastpath (cd/pwd/clear/empty) would
 # otherwise return instantly — a fingerprint. Add random jitter to

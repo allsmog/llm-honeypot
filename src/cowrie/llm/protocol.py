@@ -485,13 +485,36 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         )
 
         self._llm_t0 = time.time()
-        d: defer.Deferred[str] = self.llm_client.generate(request)
+        stream_enabled = CowrieConfig.getboolean("llm", "stream", fallback=False)
+        if stream_enabled and self.llm_client.supports_streaming():
+            d: defer.Deferred[str] = self.llm_client.generate_streaming(
+                request, on_chunk=self._on_stream_chunk,
+            )
+        else:
+            d = self.llm_client.generate(request)
         # Closure carries the request so _handle_llm_response can attach
         # the per-turn usage to the cowrie.llm.response event.
-        d.addCallback(lambda r, req=request: self._handle_llm_response(r, req))
+        d.addCallback(lambda r, req=request, streamed=stream_enabled:
+                      self._handle_llm_response(r, req, streamed=streamed))
         d.addErrback(self._handle_llm_error)
 
-    def _handle_llm_response(self, response: str, request: LLMRequest = None) -> None:
+    def _on_stream_chunk(self, text: str) -> None:
+        """Write each streaming delta to the terminal as it arrives.
+
+        Markdown stripping + observation-leak guard happen at end-of-
+        stream, not per chunk — a chunk that splits a markdown fence
+        or the marker would yield false negatives mid-stream. Accept
+        the trade-off: streaming sacrifices in-band redaction for
+        responsiveness. Final-text redaction in _handle_llm_response
+        is the safety net.
+        """
+        if self.terminal is None or not text:
+            return
+        self.terminal.write(text.encode("utf-8"))
+
+    def _handle_llm_response(
+        self, response: str, request: LLMRequest = None, *, streamed: bool = False,
+    ) -> None:
         """
         Handle the response from the LLM and display it to the user.
         """
@@ -525,7 +548,13 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                     format="LLM echoed [SHELL_OBSERVED] marker — redacted",
                 )
             self.command_history.append(f"System: {clean_response}")
-            self.terminal.write(f"{clean_response}\n".encode())
+            if streamed:
+                # Chunks already wrote the response to the terminal as
+                # they arrived. Just emit a trailing newline so the
+                # prompt that follows lands on a fresh line.
+                self.terminal.write(b"\n")
+            else:
+                self.terminal.write(f"{clean_response}\n".encode())
         # If no response, just show the prompt silently (like an empty command)
 
         self._show_prompt()

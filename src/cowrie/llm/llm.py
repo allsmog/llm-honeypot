@@ -89,6 +89,24 @@ class LLMClient:
         """
         return self.provider.generate(request)
 
+    def generate_streaming(self, request: LLMRequest, on_chunk) -> Deferred:
+        """Stream the response, calling on_chunk(text) per delta.
+
+        Returns Deferred[str] of the full accumulated text. The protocol
+        layer uses this when [llm] stream = true to make responses drip
+        rather than appear in one block — closer to real-shell behavior
+        for commands like `tail -f`.
+
+        Falls back to provider.generate() if the provider doesn't
+        support streaming.
+        """
+        if self.provider._supports_streaming():
+            return self.provider.generate_streaming(request, on_chunk)
+        return self.provider.generate(request)
+
+    def supports_streaming(self) -> bool:
+        return self.provider._supports_streaming()
+
     def get_response(self, prompt: list[str]) -> Deferred:
         """Legacy: build an LLMRequest from Cowrie's prompt list and delegate.
 
