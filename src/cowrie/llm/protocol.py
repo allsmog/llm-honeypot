@@ -17,6 +17,7 @@ from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
 from cowrie.llm.llm import LLMClient
+from cowrie.llm import persona as personamod
 
 
 def strip_markdown(text: str) -> str:
@@ -111,6 +112,22 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                     self.kippoIPv6 = addr if not addr.lower().startswith("fe80") else ""
             except Exception:
                 self.kippoIPv6 = ""
+
+        # Persona pinning: pick a stable OS profile for this session so
+        # /etc/os-release, uname -a, dpkg -l, /proc/cpuinfo etc. stay
+        # consistent across turns. Keyed off realClientIP by default so
+        # a reconnect from the same attacker sees the same persona.
+        persona_override = CowrieConfig.get("llm", "persona", fallback="auto")
+        try:
+            self.persona = personamod.pick_persona(
+                self.realClientIP, override=persona_override
+            )
+        except ValueError as e:
+            log.err(f"persona pick failed: {e}; falling back to first persona")
+            self.persona = personamod.PERSONAS[0]
+        self.boot_time = personamod.roll_boot_time(
+            self.persona, self.realClientIP
+        )
 
     def timeoutConnection(self) -> None:
         """
@@ -253,8 +270,16 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             f" The hostname is '{self.hostname}' and username is '{self.user.username}'."
             f" The current working directory is '{self.cwd}'."
         )
+        # Pin distro/kernel/uptime/cpu/memory so identity-probe commands
+        # (uname, /etc/os-release, /proc/cpuinfo, free, uptime) stay
+        # consistent across turns. Without this the LLM invents fresh
+        # values per turn and an attacker fingerprints us trivially.
+        if hasattr(self, "persona"):
+            context += "\n\n" + personamod.render_prompt_section(
+                self.persona, self.boot_time
+            )
         if exec_command:
-            context += f" The command to execute is: {exec_command}"
+            context += f"\nThe command to execute is: {exec_command}"
         return context
 
     def _process_command_with_llm(self, command: str) -> None:

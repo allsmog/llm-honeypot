@@ -435,6 +435,17 @@ log_raw = false
 # (default: true; only applies to anthropic_* providers)
 #anthropic_cache_system = true
 
+# Persona — pins distro / kernel / /proc/cpuinfo / installed packages /
+# uptime into the system prompt so attackers probing for consistency
+# (`uname -a`, `cat /etc/os-release`, `dpkg -l`) can't fingerprint the
+# honeypot via drift between turns. Default `auto` picks one of the
+# built-in personas deterministically from the attacker's source IP
+# (same attacker → same OS persona across reconnects).
+# Available: auto | ubuntu_22_04 | ubuntu_20_04 | debian_12 | debian_11
+#            | centos_7 | alpine_3_19
+# (default: auto)
+#persona = auto
+
 # Maximum LLM-bound commands per session before the honeypot degrades to
 # a static "bash: cannot fork: Resource temporarily unavailable" response.
 # Caps cost when an attacker spams commands. Fastpath commands (cd, pwd,
