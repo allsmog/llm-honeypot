@@ -16,6 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
+from cowrie.llm import downloader
 from cowrie.llm.llm import LLMClient
 from cowrie.llm import persona as personamod
 
@@ -161,7 +162,42 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         if self._try_fastpath(string):
             return
+        if self._try_download_intercept(string):
+            return
         self._process_command_with_llm(string)
+
+    def _try_download_intercept(self, command: str) -> bool:
+        """If the command is a wget/curl/tftp/ftpget, fetch first then
+        run the LLM with the real outcome injected as ground truth.
+
+        Returns True when the command was intercepted (the LLM dispatch
+        happens later in the fetch callback); False to fall through to
+        the normal LLM path.
+        """
+        if not CowrieConfig.getboolean("llm", "capture_downloads", fallback=True):
+            return False
+        intent = downloader.parse_download_command(command)
+        if intent is None:
+            return False
+
+        def on_result(result):
+            observation = downloader.render_observation(intent, result)
+            self._process_command_with_llm(command, observation=observation)
+
+        d = downloader.fetch(intent, log_event=self._log_download_event)
+        d.addCallback(on_result)
+        d.addErrback(self._handle_llm_error)
+        return True
+
+    def _log_download_event(self, **kwargs) -> None:
+        """Adapter: downloader calls this; we tag sessionno so the JSON
+        output dispatcher picks the event up (same trick as the LLM
+        prompt/response events). The HTTP callbacks fire outside the
+        SSH protocol's logging context, so the auto-detected `system`
+        prefix wouldn't match Cowrie's regex.
+        """
+        kwargs.setdefault("sessionno", f"S{self.sessionno}")
+        log.msg(**kwargs)
 
     def _try_fastpath(self, command: str) -> bool:
         """Handle trivial commands locally without an LLM round-trip.
@@ -282,10 +318,16 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             context += f"\nThe command to execute is: {exec_command}"
         return context
 
-    def _process_command_with_llm(self, command: str) -> None:
+    def _process_command_with_llm(
+        self, command: str, observation: str | None = None
+    ) -> None:
         """
         Process a command by sending it to the LLM and writing the response
         to the terminal.
+
+        ``observation``: optional [SHELL_OBSERVED] block produced by the
+        download interceptor — appended to the user message so the LLM's
+        narration matches the real fetch outcome.
         """
         # Cost cap. An attacker spamming `for i in $(seq 1 10000); do ls; done`
         # would otherwise run up unbounded API spend. After the cap, return
@@ -322,7 +364,10 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             self.llm_client = shared if shared is not None else LLMClient()
             self.command_history = []
 
-        self.command_history.append(f"User: {command}")
+        user_msg = command
+        if observation:
+            user_msg = f"{observation}\n{command}"
+        self.command_history.append(f"User: {user_msg}")
 
         system_context = self._build_system_context()
         prompt = [system_context, *self.command_history[-10:]]
@@ -363,6 +408,15 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         if response:
             clean_response = strip_markdown(response)
+            # Defensive: if the model leaked the observation marker back,
+            # redact it (and log the leak so we can audit prompt hygiene).
+            clean_response, leaked = downloader.strip_leaked_observation(clean_response)
+            if leaked:
+                log.msg(
+                    eventid="cowrie.llm.observation_leak",
+                    sessionno=f"S{self.sessionno}",
+                    format="LLM echoed [SHELL_OBSERVED] marker — redacted",
+                )
             self.command_history.append(f"System: {clean_response}")
             self.terminal.write(f"{clean_response}\n".encode())
         # If no response, just show the prompt silently (like an empty command)

@@ -435,6 +435,22 @@ log_raw = false
 # (default: true; only applies to anthropic_* providers)
 #anthropic_cache_system = true
 
+# Intercept wget/curl/tftp/ftpget commands and actually fetch the URL
+# (HTTP/HTTPS only for now) before sending the command to the LLM.
+# Capture lands under [honeypot] download_path with a SHA-256 filename,
+# and the real outcome (success / bytes / sha256 / partial / blocked)
+# is injected into the LLM turn as ground truth so its narration
+# matches reality. SSRF is gated by cowrie.core.network.communication_allowed.
+# (default: true)
+#capture_downloads = true
+
+# Per-download size cap for the LLM-backend interceptor. Tighter than
+# [honeypot] download_limit_size because the LLM path is meant for
+# threat-intel sampling, not whole-file archiving. 0 = unlimited.
+# The smaller of this and [honeypot] download_limit_size wins.
+# (default: 10485760 — 10 MiB)
+#download_limit_size_llm = 10485760
+
 # Persona — pins distro / kernel / /proc/cpuinfo / installed packages /
 # uptime into the system prompt so attackers probing for consistency
 # (`uname -a`, `cat /etc/os-release`, `dpkg -l`) can't fingerprint the
