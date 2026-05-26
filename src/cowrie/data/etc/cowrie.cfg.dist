@@ -391,32 +391,60 @@ log_raw = false
 
 [llm]
 
-# API key for the LLM service (required for LLM backend)
-# For OpenAI: get your key from https://platform.openai.com/api-keys
-#api_key = sk-xxx
+# Which LLM provider to use. Built-in providers:
+#   anthropic_apikey - Anthropic Messages API, x-api-key auth
+#   anthropic_oauth  - Anthropic Messages API, OAuth bearer token (Claude Code session)
+#   codex_apikey     - OpenAI /v1/chat/completions, Bearer api-key auth
+#   codex_oauth      - Codex CLI OAuth bearer token (ChatGPT Plus/Pro session)
+# (default: anthropic_apikey)
+#provider = anthropic_apikey
 
-# LLM model to use
-# (default: gpt-4o-mini)
-#model = gpt-4o-mini
+# Model name passed to the provider. Defaults are provider-specific:
+#   anthropic_*: claude-haiku-4-5-20251001   (fast + cheap, recommended)
+#   codex_*:     gpt-4o-mini
+#model = claude-haiku-4-5-20251001
 
-# API host URL
-# (default: https://api.openai.com)
-#host = https://api.openai.com
+# Override the provider's default API host. Rarely needed except for
+# self-hosted OpenAI-compatible endpoints (vLLM, Ollama with OpenAI shim, ...).
+#host = https://api.anthropic.com
 
-# API path
-# (default: /v1/chat/completions)
+# Override the provider's default request path. Only applies to OpenAI-shape
+# providers (codex_apikey, codex_oauth).
 #path = /v1/chat/completions
 
-# Maximum tokens in the response
+# --- credentials (set the one(s) matching your selected provider) ---
+
+# anthropic_apikey: get a key from https://console.anthropic.com/settings/keys
+#anthropic_api_key = sk-ant-xxx
+
+# anthropic_oauth: by default reads the token written by `claude auth login`.
+# On macOS that lives in Keychain (service "Claude Code-credentials"); on
+# Linux it's at ~/.config/claude-code/credentials.json. Set a file path to
+# override (e.g. multiple accounts, or a manually-exported token).
+#anthropic_oauth_token_file =
+#anthropic_oauth_keychain_service = Claude Code-credentials
+
+# codex_apikey: get a key from https://platform.openai.com/api-keys
+#openai_api_key = sk-xxx
+
+# codex_oauth: credentials file written by the Codex CLI auth flow.
+#codex_oauth_token_file = ~/.codex/auth.json
+
+# Cache the system prompt with Anthropic prompt caching. Big win for
+# multi-turn sessions where the persona/world prompt is stable.
+# (default: true; only applies to anthropic_* providers)
+#anthropic_cache_system = true
+
+# Maximum tokens in the response.
 # (default: 500)
 #max_tokens = 500
 
-# Temperature for response generation (0.0-2.0)
-# Higher values make output more random, lower values more deterministic
+# Temperature for response generation (0.0-2.0). Lower = more deterministic
+# command output, which is usually what you want for a believable shell.
 # (default: 0.7)
 #temperature = 0.7
 
-# Enable debug logging for LLM requests/responses
+# Enable debug logging of every LLM request and response.
 # (default: false)
 #debug = false
 
