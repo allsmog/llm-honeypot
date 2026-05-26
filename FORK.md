@@ -246,6 +246,26 @@ coverage report --include='*/cowrie/llm/*'
   party host with the attacker's credentials is operationally risky
   enough that v1 leaves scp to the LLM's narration.
 
+## Publishing this fork to GitHub
+
+Pre-push checks already passed in CI (no credentials in history,
+`etc/cowrie.cfg` gitignored, 24 thematic commits on top of upstream
+Cowrie). To push to your own GitHub fork:
+
+```bash
+# Sanity re-check before pushing (run these from cowrie/):
+git log -p | grep -E "sk-ant-|sk-proj-|Bearer " | head        # should be empty
+git check-ignore etc/cowrie.cfg                                # should echo path
+
+# Create the fork on GitHub (web UI or `gh repo create your-user/llm-honeypot`)
+# then:
+git remote add origin git@github.com:your-user/llm-honeypot.git
+git push -u origin main
+```
+
+`upstream` already points at cowrie/cowrie so future `git fetch upstream`
++ `git merge upstream/master` keeps your fork current.
+
 ## License
 
 BSD-3-Clause, same as upstream Cowrie.
