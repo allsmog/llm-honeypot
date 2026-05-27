@@ -44,7 +44,8 @@ so a token refresh by the CLI mid-session doesn't drop the next attacker command
 ## Quickstart
 
 ```bash
-cd cowrie
+git clone https://github.com/your-user/llm-honeypot.git
+cd llm-honeypot
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 cp src/cowrie/data/etc/cowrie.cfg.dist etc/cowrie.cfg
