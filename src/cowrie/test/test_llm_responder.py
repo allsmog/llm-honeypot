@@ -412,6 +412,97 @@ class TestMisc(unittest.TestCase):
         self.assertIn("PID TTY", out)
         self.assertIn("bash", out)
 
+    def test_bare_ps_default2(self):
+        out = R.respond("ps", _ctx()).output
+        self.assertIn("PID TTY", out)
+
+    # --- interactive / batch-mode programs ---
+
+    def test_top_batch_renders_frame(self):
+        out = R.respond("top -bn1", _ctx()).output
+        self.assertTrue(out.startswith("top - "))
+        self.assertIn("Tasks:", out)
+        self.assertIn("MiB Mem :", out)
+        self.assertIn("PID USER", out)
+
+    def test_top_batch_combined_flags(self):
+        for cmd in ("top -b -n 1", "top -bn 1", "top -bn1"):
+            self.assertIsNotNone(R.respond(cmd, _ctx()), cmd)
+
+    def test_bare_top_defers(self):
+        self.assertIsNone(R.respond("top", _ctx()))
+
+    def test_top_mem_matches_free_total(self):
+        ctx = _ctx()
+        top = R.respond("top -bn1", ctx).output
+        # MiB Mem total should reflect the persona's memtotal (kB/1024).
+        mib = ctx.persona.memtotal_kb / 1024.0
+        self.assertIn(f"{mib:9.1f} total", top)
+
+    def test_ping_bounded_renders(self):
+        out = R.respond("ping -c 3 8.8.8.8", _ctx()).output
+        self.assertIn("PING 8.8.8.8", out)
+        self.assertEqual(out.count("icmp_seq="), 3)
+        self.assertIn("3 packets transmitted, 3 received", out)
+        self.assertIn("rtt min/avg/max/mdev", out)
+
+    def test_ping_unbounded_defers(self):
+        self.assertIsNone(R.respond("ping 8.8.8.8", _ctx()))
+
+    def test_ping_stable(self):
+        ctx = _ctx()
+        self.assertEqual(
+            R.respond("ping -c 4 1.1.1.1", ctx).output,
+            R.respond("ping -c 4 1.1.1.1", ctx).output,
+        )
+
+    # --- storage / network recon ---
+
+    def test_df_and_df_h(self):
+        plain = R.respond("df", _ctx()).output
+        self.assertIn("Filesystem", plain)
+        self.assertIn("/dev/vda1", plain)
+        self.assertIn("1K-blocks", plain)
+        human = R.respond("df -h", _ctx()).output
+        self.assertRegex(human, r"/dev/vda1.*Gi")
+
+    def test_mount_and_proc_mounts_agree_on_root(self):
+        ctx = _ctx()
+        m = R.respond("mount", ctx).output
+        pm = R.respond("cat /proc/mounts", ctx).output
+        self.assertIn("/dev/vda1 on / type ext4", m)
+        self.assertIn("/dev/vda1 / ext4", pm)
+
+    def test_ss_listening_shows_sshd(self):
+        out = R.respond("ss -tlnp", _ctx()).output
+        self.assertIn("LISTEN", out)
+        self.assertIn(":22", out)
+        self.assertIn("sshd", out)
+
+    def test_ss_without_listen_flag_defers(self):
+        self.assertIsNone(R.respond("ss -t", _ctx()))
+
+    def test_netstat_listening_shows_sshd(self):
+        out = R.respond("netstat -tlnp", _ctx()).output
+        self.assertIn("LISTEN", out)
+        self.assertIn("612/sshd", out)
+
+    def test_crontab_l_empty(self):
+        self.assertEqual(
+            R.respond("crontab -l", _ctx(login_user="bob")).output,
+            "no crontab for bob\n",
+        )
+
+    def test_etc_crontab(self):
+        out = R.respond("cat /etc/crontab", _ctx()).output
+        self.assertIn("run-parts", out)
+        self.assertIn("SHELL=/bin/sh", out)
+
+    def test_vmstat(self):
+        out = R.respond("vmstat", _ctx()).output
+        self.assertIn("procs", out)
+        self.assertIn("swpd", out)
+
     def test_junk_input_never_raises(self):
         # respond() must be total — any garbage returns None, never raises.
         for junk in ("\\\x00bad", "uname " + "-" * 5000, "cat " + "/" * 3000):

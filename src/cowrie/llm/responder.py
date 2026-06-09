@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import time
 from dataclasses import dataclass
@@ -155,9 +156,12 @@ def _peel_sudo(argv: list[str]) -> tuple[list[str] | None, str | None]:
     return inner, target
 
 
-# Full-screen / continuous programs we don't deterministically emulate.
+# Full-screen / continuous programs we don't deterministically emulate in
+# line mode (true editors and live monitors take over the TTY). `top` and
+# `ping` are NOT here — their bounded/batch forms (`top -bn1`, `ping -c N`)
+# are handled in the dispatch table and only the interactive forms defer.
 _INTERACTIVE = {
-    "vi", "vim", "nano", "emacs", "less", "more", "top", "htop", "watch",
+    "vi", "vim", "nano", "emacs", "less", "more", "htop", "watch",
 }
 
 
@@ -663,6 +667,42 @@ def _etc_resolv(ctx) -> str:
     )
 
 
+def _proc_mounts(ctx) -> str:
+    return (
+        "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+        "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+        "udev /dev devtmpfs rw,nosuid,relatime,size=1996212k,mode=755 0 0\n"
+        "devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620 0 0\n"
+        "tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=401544k,mode=755 0 0\n"
+        "/dev/vda1 / ext4 rw,relatime 0 0\n"
+        "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
+        "tmpfs /run/lock tmpfs rw,nosuid,nodev,noexec,relatime,size=5120k 0 0\n"
+        "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
+    )
+
+
+def _etc_crontab(ctx) -> str:
+    return (
+        "# /etc/crontab: system-wide crontab\n"
+        "# Unlike any other crontab you don't have to run the `crontab'\n"
+        "# command to install the new version when you edit this file\n"
+        "# and files in /etc/cron.d. These files also have username fields,\n"
+        "# that none of the other crontabs do.\n"
+        "\n"
+        "SHELL=/bin/sh\n"
+        "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+        "\n"
+        "# m h dom mon dow user\tcommand\n"
+        "17 *\t* * *\troot    cd / && run-parts --report /etc/cron.hourly\n"
+        "25 6\t* * *\troot\ttest -x /usr/sbin/anacron || "
+        "( cd / && run-parts --report /etc/cron.daily )\n"
+        "47 6\t* * 7\troot\ttest -x /usr/sbin/anacron || "
+        "( cd / && run-parts --report /etc/cron.weekly )\n"
+        "52 6\t1 * *\troot\ttest -x /usr/sbin/anacron || "
+        "( cd / && run-parts --report /etc/cron.monthly )\n"
+    )
+
+
 def _cat_one(path: str, ctx, user) -> ResponderResult | None:
     """Render a single known /etc or /proc file, or None to defer."""
     p = ctx.persona
@@ -672,6 +712,9 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
         "/proc/loadavg": lambda: _proc_loadavg(ctx),
         "/proc/version": lambda: _proc_version(ctx),
         "/proc/uptime": lambda: _proc_uptime(ctx),
+        "/proc/mounts": lambda: _proc_mounts(ctx),
+        "/etc/mtab": lambda: _proc_mounts(ctx),
+        "/etc/crontab": lambda: _etc_crontab(ctx),
         "/etc/os-release": lambda: _os_release(ctx),
         "/usr/lib/os-release": lambda: _os_release(ctx),
         "/etc/issue": lambda: _etc_issue(ctx),
@@ -947,8 +990,6 @@ def _h_echo(args, ctx, user):
 
 
 def _expand_word(word: str, ctx, user) -> str:
-    import re
-
     def repl(m):
         name = m.group(1) or m.group(2)
         val = _expand_var(name, ctx, user)
@@ -1022,6 +1063,248 @@ def _h_w(args, ctx, user):
 
 
 # ----------------------------------------------------------------------
+# Interactive / batch-mode programs + storage / network recon
+
+
+def _mem_mib(ctx) -> dict[str, float]:
+    m = _mem_breakdown(ctx)
+    return {k: v / 1024.0 for k, v in m.items()}
+
+
+def _h_top(args, ctx, user):
+    # Only handle BATCH mode (`top -bn1`, `top -b -n 1`). In batch mode real
+    # top renders one frame and exits, so a single deterministic frame is
+    # exactly correct. Interactive `top` (no -b) is full-screen — defer to
+    # the LLM (the hardened prompt tells it to render a live frame).
+    flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
+    if "b" not in flags and "--batch" not in args:
+        return None
+    _, days, hrs, mins = _uptime_parts(ctx.boot_time)
+    now = datetime.now().strftime("%H:%M:%S")
+    up = f"{days} days, {hrs:02d}:{mins:02d}" if days else f"{hrs:02d}:{mins:02d}"
+    l1, l5, l15 = _h_loadavg(ctx)
+    mib = _mem_mib(ctx)
+    procs = _base_processes(ctx)
+    for pf in ctx.world.processes.values():
+        procs.append((pf.user, pf.pid, 9121, pf.command))
+    procs.append((ctx.user, 9200, 9121, "top -bn1"))
+    ntasks = len(procs) + 88  # plausible total beyond what we list
+    r = _rng_floats((ctx.seed or ctx.hostname) + "|top", len(procs) * 2)
+    header = [
+        f"top - {now} up {up},  1 user,  load average: {l1:.2f}, {l5:.2f}, {l15:.2f}",
+        f"Tasks: {ntasks:>3} total,   1 running, {ntasks - 1:>3} sleeping,   "
+        f"0 stopped,   0 zombie",
+        "%Cpu(s):  0.7 us,  0.3 sy,  0.0 ni, 98.9 id,  0.1 wa,  0.0 hi,  "
+        "0.0 si,  0.0 st",
+        f"MiB Mem :{mib['total']:9.1f} total,{mib['free']:9.1f} free,"
+        f"{mib['used']:9.1f} used,{mib['buffers'] + mib['cached']:9.1f} buff/cache",
+        f"MiB Swap:{mib['total']:9.1f} total,{mib['total']:9.1f} free,"
+        f"{0.0:9.1f} used.{mib['available']:9.1f} avail Mem",
+        "",
+        "    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM"
+        "     TIME+ COMMAND",
+    ]
+    rows = []
+    for i, (u, pid, _ppid, cmd) in enumerate(procs):
+        cpu = (r[i % len(r)] * 0.5) if not cmd.startswith("top") else 0.7
+        mem = 0.1 + r[(i + 1) % len(r)] * 1.0
+        virt = 12000 + int(r[i % len(r)] * 300000)
+        res = 3000 + int(r[i % len(r)] * 30000)
+        shr = 2000 + int(r[i % len(r)] * 8000)
+        state = "R" if cmd.startswith("top") else "S"
+        name = cmd.split()[0].lstrip("-").rsplit("/", 1)[-1][:15]
+        rows.append(
+            f"{pid:>7} {u:<8}  20   0 {virt:>7} {res:>6} {shr:>6} {state}"
+            f" {cpu:>5.1f} {mem:>5.1f}   0:00.{i:02d} {name}"
+        )
+    return ResponderResult(output="\n".join(header + rows) + "\n")
+
+
+def _h_ping(args, ctx, user):
+    # Only handle the BOUNDED form (`ping -c N host`). Unbounded ping runs
+    # until Ctrl-C — defer that to the LLM. Real ping with -c exits after N.
+    count = None
+    host = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-c" and i + 1 < len(args):
+            try:
+                count = int(args[i + 1])
+            except ValueError:
+                return None
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        host = a
+        i += 1
+    if count is None or host is None or count <= 0 or count > 20:
+        return None
+    # Resolve to a plausible IP: keep literals, synthesize for names.
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+        ip = host
+    else:
+        rb = _rng_floats((ctx.seed or "") + "|ping|" + host, 4)
+        ip = ".".join(str(1 + int(x * 253)) for x in rb)
+    # Plausible external-host RTTs (ms). A few ms for a literal IP that looks
+    # local (10./192.168./127.), otherwise internet-ish 5-40 ms.
+    local = re.match(r"^(10\.|192\.168\.|127\.|172\.(1[6-9]|2\d|3[01])\.)", ip)
+    base, span = (0.2, 1.5) if local else (6.0, 34.0)
+    rtts = []
+    rb = _rng_floats((ctx.seed or "") + "|rtt|" + host, count)
+    lines = [f"PING {host} ({ip}) 56(84) bytes of data."]
+    for seq in range(1, count + 1):
+        t = round(base + rb[seq - 1] * span, 1)
+        rtts.append(t)
+        lines.append(
+            f"64 bytes from {ip}: icmp_seq={seq} ttl=64 time={t:.1f} ms"
+        )
+    lo, hi = min(rtts), max(rtts)
+    avg = round(sum(rtts) / len(rtts), 3)
+    mdev = round((hi - lo) / 2, 3)
+    # ping sends one packet per second, so N packets take ~(N-1)s.
+    total_ms = (count - 1) * 1000 + int(rb[0] * 60)
+    lines += [
+        "",
+        f"--- {host} ping statistics ---",
+        f"{count} packets transmitted, {count} received, 0% packet loss, "
+        f"time {total_ms}ms",
+        f"rtt min/avg/max/mdev = {lo:.3f}/{avg:.3f}/{hi:.3f}/{mdev:.3f} ms",
+    ]
+    return ResponderResult(output="\n".join(lines) + "\n")
+
+
+def _h_vmstat(args, ctx, user):
+    m = _mem_breakdown(ctx)
+    l1, _l5, _l15 = _h_loadavg(ctx)
+    swpd = 0
+    return ResponderResult(
+        output=(
+            "procs -----------memory---------- ---swap-- -----io---- "
+            "-system-- ------cpu-----\n"
+            " r  b   swpd   free   buff  cache   si   so    bi    bo   in   "
+            "cs us sy id wa st\n"
+            f" {1 if l1 > 0.5 else 0}  0 {swpd:>6} {m['free']:>6} "
+            f"{m['buffers']:>6} {m['cached']:>6}    0    0     5    12   "
+            f"40   80  1  0 99  0  0\n"
+        )
+    )
+
+
+def _disk(ctx) -> dict[str, int]:
+    """Plausible root-disk sizes (1K-blocks), stable per session."""
+    r = _rng_floats((ctx.seed or ctx.hostname) + "|disk", 2)
+    total = 20 * 1024 * 1024 + int(r[0] * 40 * 1024 * 1024)  # 20-60 GiB
+    used = int(total * (0.12 + r[1] * 0.35))
+    avail = total - used - int(total * 0.05)  # 5% reserved
+    return {"total": total, "used": used, "avail": max(avail, 0)}
+
+
+def _h_df(args, ctx, user):
+    human = "-h" in args or "--human-readable" in args
+    d = _disk(ctx)
+    tmpfs = ctx.persona.memtotal_kb // 2
+    runfs = ctx.persona.memtotal_kb // 10
+
+    def col(v: int) -> str:
+        return _human_kb(v) if human else str(v)
+
+    def pct(used: int, total: int) -> str:
+        return f"{round(used * 100 / total) if total else 0}%"
+
+    unit_hdr = "Size  Used Avail Use%" if human else "1K-blocks     Used Available Use%"
+    lines = [f"Filesystem     {unit_hdr} Mounted on"]
+    rows = [
+        ("/dev/vda1", d["total"], d["used"], d["avail"], "/"),
+        ("tmpfs", tmpfs, 0, tmpfs, "/dev/shm"),
+        ("tmpfs", runfs, int(runfs * 0.02), int(runfs * 0.98), "/run"),
+        ("udev", tmpfs, 0, tmpfs, "/dev"),
+    ]
+    for fs, total, used, avail, mnt in rows:
+        if human:
+            lines.append(
+                f"{fs:<14} {_human_kb(total):>5} {_human_kb(used):>5} "
+                f"{_human_kb(avail):>5} {pct(used, total):>4} {mnt}"
+            )
+        else:
+            lines.append(
+                f"{fs:<14} {total:>9} {used:>8} {avail:>9} {pct(used, total):>4} {mnt}"
+            )
+    return ResponderResult(output="\n".join(lines) + "\n")
+
+
+def _h_mount(args, ctx, user):
+    if args:  # `mount /dev/x /mnt` etc. — defer (it's an action)
+        return None
+    lines = [
+        "sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)",
+        "proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)",
+        "udev on /dev type devtmpfs (rw,nosuid,relatime,size=1996212k,"
+        "nr_inodes=499053,mode=755)",
+        "devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,"
+        "gid=5,mode=620,ptmxmode=000)",
+        "tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,"
+        "size=401544k,mode=755)",
+        "/dev/vda1 on / type ext4 (rw,relatime)",
+        "tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev)",
+        "tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k)",
+        "cgroup2 on /sys/fs/cgroup type cgroup2 "
+        "(rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot)",
+    ]
+    return ResponderResult(output="\n".join(lines) + "\n")
+
+
+def _h_ss(args, ctx, user):
+    # Listening TCP sockets (ss -tlnp / -tln / -lntp). Shows sshd on :22.
+    joined = "".join(a[1:] for a in args if a.startswith("-"))
+    if "l" not in joined and "a" not in joined:
+        return None  # connection dumps vary too much — defer
+    show_proc = "p" in joined
+    proc4 = '          users:(("sshd",pid=612,fd=3))' if show_proc else ""
+    proc6 = '          users:(("sshd",pid=612,fd=4))' if show_proc else ""
+    hdr = (
+        "State    Recv-Q   Send-Q     Local Address:Port      "
+        "Peer Address:Port  Process"
+    )
+    lines = [
+        hdr,
+        f"LISTEN   0        128              0.0.0.0:22"
+        f"             0.0.0.0:*{proc4}",
+        f"LISTEN   0        128                 [::]:22"
+        f"                [::]:*{proc6}",
+    ]
+    return ResponderResult(output="\n".join(lines) + "\n")
+
+
+def _h_netstat(args, ctx, user):
+    joined = "".join(a[1:] for a in args if a.startswith("-"))
+    if "l" not in joined and "a" not in joined:
+        return None
+    show_prog = "p" in joined
+    prog = "612/sshd" if show_prog else ""
+    prog_hdr = "PID/Program name" if show_prog else ""
+    lines = [
+        "Active Internet connections (only servers)",
+        f"Proto Recv-Q Send-Q Local Address           Foreign Address"
+        f"         State       {prog_hdr}",
+        f"tcp        0      0 0.0.0.0:22              0.0.0.0:*"
+        f"               LISTEN      {prog}",
+        f"tcp6       0      0 :::22                   :::*"
+        f"                    LISTEN      {prog}",
+    ]
+    return ResponderResult(output="\n".join(lines) + "\n")
+
+
+def _h_crontab(args, ctx, user):
+    if "-l" in args:
+        # Fresh box: no per-user crontab.
+        return ResponderResult(output=f"no crontab for {user}\n")
+    return None  # -e (edit) is interactive; -r (remove) is an action — defer
+
+
+# ----------------------------------------------------------------------
 # Dispatch table
 
 
@@ -1046,6 +1329,14 @@ _DISPATCH = {
     "which": _h_which,
     "command": None,  # filled below to share `which` for `command -v`
     "w": _h_w,
+    "top": _h_top,        # batch mode only (-bn1); interactive defers
+    "ping": _h_ping,      # bounded (-c N) only; unbounded defers
+    "vmstat": _h_vmstat,
+    "df": _h_df,
+    "mount": _h_mount,
+    "ss": _h_ss,
+    "netstat": _h_netstat,
+    "crontab": _h_crontab,
 }
 
 

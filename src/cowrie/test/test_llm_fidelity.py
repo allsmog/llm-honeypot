@@ -62,18 +62,29 @@ class TestConsistencyInvariants(unittest.TestCase):
         ctx = fidelity.build_context("ubuntu_22_04")
         self.assertGreaterEqual(len(fidelity.run_consistency(ctx)), 12)
 
-    def test_catches_an_injected_contradiction(self):
-        # Sanity that the gate actually fails when reality is broken: monkey
-        # a persona whose nproc and cpuinfo would disagree is hard to force,
-        # so instead corrupt the hostname mid-flight and check the relevant
-        # invariant flips. We rebuild a context with mismatched hostname by
-        # pushing a user the passwd doesn't know — no; simplest: verify a
-        # known-good context passes, then assert the check function is real
-        # by confirming at least one check references 'hostname'.
-        ctx = fidelity.build_context("debian_12")
-        names = {c.name for c in fidelity.run_consistency(ctx)}
-        self.assertTrue(any("hostname" in n for n in names))
-        self.assertTrue(any("nproc" in n for n in names))
+    def test_gate_is_not_vacuous_detects_real_contradiction(self):
+        # Prove the gate actually flips to FAIL when an invariant is broken:
+        # patch one command's output to contradict /etc/hostname, and confirm
+        # the hostname invariant reports passed=False (and the CLI would exit
+        # non-zero).
+        from cowrie.llm import responder as R
+
+        ctx = fidelity.build_context("ubuntu_22_04")
+        real_respond = R.respond
+
+        def fake(cmd, c):
+            if cmd == "cat /etc/hostname":
+                return R.ResponderResult(output="WRONGHOST\n")
+            return real_respond(cmd, c)
+
+        self.patch(R, "respond", fake)
+        results = fidelity.run_consistency(ctx)
+        hostname_checks = [r for r in results if "hostname" in r.name]
+        self.assertTrue(hostname_checks)
+        self.assertTrue(
+            any(not r.passed for r in hostname_checks),
+            msg="gate did not detect the injected hostname contradiction",
+        )
 
 
 class TestCoverage(unittest.TestCase):

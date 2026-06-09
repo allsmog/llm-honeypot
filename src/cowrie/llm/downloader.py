@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # ABOUTME: Real-payload capture for the LLM backend. When the attacker
-# ABOUTME: runs wget/curl/tftp/ftpget, we (a) parse the URL out of the
-# ABOUTME: command, (b) actually fetch it (HTTP/HTTPS) through Cowrie's
-# ABOUTME: SSRF gate, (c) persist via cowrie.core.artifact.Artifact, and
-# ABOUTME: (d) hand the LLM a [SHELL_OBSERVED] block so its narration
-# ABOUTME: matches reality. TFTP and FTP are detected but their bodies
-# ABOUTME: aren't fetched yet (Phase 4 follow-up); the intent + URL still
-# ABOUTME: lands in the threat-intel log.
+# ABOUTME: runs wget/curl (HTTP/HTTPS/FTP), tftp, or ftpget, we (a) parse
+# ABOUTME: the URL out of the command, (b) actually fetch the bytes through
+# ABOUTME: Cowrie's SSRF gate (real HTTP via treq, real TFTP via the RFC1350
+# ABOUTME: client, real FTP via Twisted's FTPClient), (c) persist via
+# ABOUTME: cowrie.core.artifact.Artifact, and (d) hand the LLM a
+# ABOUTME: [SHELL_OBSERVED] block so its narration matches reality. scp is
+# ABOUTME: intent-only (refused-by-default) — capturing the inbound binary
+# ABOUTME: SCP stream needs an SSH-channel hook below this protocol layer.
 
 from __future__ import annotations
 
@@ -40,8 +41,8 @@ class DownloadIntent:
     raw_command: str
 
 
-# Tools whose first token signals a download. tftp/ftpget are recognized
-# but currently logged-only (no fetch). wget/curl drive real HTTP fetches.
+# Tools whose first token signals a download. wget/curl/tftp/ftpget all
+# drive real fetches (HTTP/FTP/TFTP); scp is intent-only (refused).
 _DOWNLOAD_TOOLS = {"wget", "curl", "tftp", "ftpget", "scp"}
 
 
@@ -393,29 +394,6 @@ def _refuse_scp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
         url=intent.url,
         error_message="Permission denied (publickey,password).",
     ))
-
-
-def _refuse_unimplemented(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
-    """Log the attempt but skip the actual fetch.
-
-    Threat intel still captures the URL via cowrie.session.file_download.failed;
-    the LLM narrates a connect timeout via the observation. When real
-    FTP/TFTP fetch is implemented (Phase 3 follow-up), this disappears.
-    """
-    log_event(
-        eventid="cowrie.session.file_download.failed",
-        url=intent.url,
-        outfile=intent.outfile,
-        format="Attempted %(eventid)s of %(url)s (LLM-honeypot does not "
-               "fetch this protocol yet)",
-    )
-    return defer.succeed(
-        FetchResult(
-            outcome="failed_connection",
-            url=intent.url,
-            error_message="Connection timed out",
-        )
-    )
 
 
 def _fetch_http(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:

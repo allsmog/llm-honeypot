@@ -126,11 +126,13 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 - **Deterministic responder for identity/info commands.** The single
   biggest believability win. `whoami`, `id`, `groups`, `hostname`, `uname`
   (all flag forms), `arch`, `nproc`, `uptime`, `free`, `lscpu`, `ps`
-  (`aux`/`-ef`/bare), `env`/`printenv`, `echo` (with `$VAR` expansion),
-  `which`/`command -v`, `date`, `w`, and `cat` of `/etc/os-release`,
-  `/etc/passwd`, `/etc/group`, `/etc/shadow`, `/proc/cpuinfo`,
-  `/proc/meminfo`, `/proc/loadavg`, `/etc/hostname`, … are rendered
-  locally from the pinned persona + per-session WorldState in
+  (`aux`/`-ef`/bare), `top -bn1`, `vmstat`, `ping -c N`, `df`/`df -h`,
+  `mount`, `ss`/`netstat` (listening), `crontab -l`, `env`/`printenv`,
+  `echo` (with `$VAR` expansion), `which`/`command -v`, `date`, `w`, and
+  `cat` of `/etc/os-release`, `/etc/passwd`, `/etc/group`, `/etc/shadow`,
+  `/etc/crontab`, `/proc/cpuinfo`, `/proc/meminfo` (full 54-field render),
+  `/proc/mounts`, `/proc/loadavg`, `/etc/hostname`, … are rendered locally
+  from the pinned persona + per-session WorldState in
   `cowrie/llm/responder.py` — never the model. This closes three honeypot
   fingerprints at once that the 2025 SoK on honeypots+LLMs calls out:
   **timing** (microsecond response with jitter, instead of the ~300–500ms
@@ -185,15 +187,17 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
   Distro, kernel, /proc/cpuinfo model, memtotal, uptime range, package
   list all pinned in the system prompt — `uname -a`, `cat /etc/os-release`,
   `uptime`, `free`, `/proc/cpuinfo` stay consistent across turns.
-- **Real payload capture.** `wget`/`curl` are intercepted before the
-  LLM; the actual file is fetched via `treq`, persisted under
-  `[honeypot] download_path` with a SHA-256 filename, and logged as
-  `cowrie.session.file_download` (same event shape as upstream's shell
-  backend). SSRF is gated by `cowrie.core.network.communication_allowed`
-  — AWS/GCP metadata (169.254.169.254), RFC1918, loopback all blocked.
-  A `[SHELL_OBSERVED]` block carrying the real bytes/sha/url/status is
-  injected into the next LLM turn so its narration matches reality.
-  `tftp` / `ftpget` are parsed and their URLs logged but not yet fetched.
+- **Real payload capture.** `wget`/`curl`/`tftp`/`ftpget` are intercepted
+  before the LLM and the actual bytes are fetched — HTTP/HTTPS via `treq`,
+  TFTP via the RFC 1350 client, FTP via Twisted's `FTPClient` — then
+  persisted under `[honeypot] download_path` with a SHA-256 filename and
+  logged as `cowrie.session.file_download` (same event shape as upstream's
+  shell backend). SSRF is gated by
+  `cowrie.core.network.communication_allowed` — AWS/GCP metadata
+  (169.254.169.254), RFC1918, loopback all blocked. A `[SHELL_OBSERVED]`
+  block carrying the real bytes/sha/url/status is injected into the next
+  LLM turn so its narration matches reality. `scp` is intent-only
+  (refused-by-default; see Known limitations).
 - **Per-session WorldState.** Files actually downloaded persist into a
   WorldState object that flows into the system prompt's mutable-tail
   segment. Multi-turn consistency: `curl -o /tmp/x ...` then `ls /tmp`
@@ -209,13 +213,15 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## Test coverage
 
-237 trial tests across 12 files under `src/cowrie/test/test_llm_*.py`,
+253 trial tests across 12 files under `src/cowrie/test/test_llm_*.py`,
 all green (2 skipped on optional deps). The deterministic responder,
 persona, WorldState, command parser, prompt contract, and fidelity
-harness are heavily covered; `test_llm_responder.py` alone has 80 cases
+harness are heavily covered; `test_llm_responder.py` alone has 96 cases
 asserting per-distro file behavior, cross-command consistency (`id` vs
-`/etc/passwd`, `nproc` vs `/proc/cpuinfo`), the su/sudo effective-user
-flow, and graceful deferral of anything not modeled.
+`/etc/passwd`, `nproc` vs `/proc/cpuinfo`, `mount` vs `df` vs
+`/proc/mounts`, `ss` vs `netstat`), batch/interactive handling
+(`top -bn1`, `ping -c N`), the su/sudo effective-user flow, and graceful
+deferral of anything not modeled.
 
 | Module | Coverage |
 |---|---|
@@ -242,13 +248,16 @@ flow, and graceful deferral of anything not modeled.
 deterministic responder on the two believability axes the honeypot
 literature uses, and doubles as a CI regression gate:
 
-- **Consistency** — 16 cross-command / against-persona invariants that
+- **Consistency** — 19 cross-command / against-persona invariants that
   must hold (`uname -r` ⊂ `uname -a`, `nproc` == `/proc/cpuinfo` block
   count, `id www-data` == `/etc/passwd` uid 33, `hostname` ==
   `/etc/hostname`, `free` total == `/proc/meminfo` MemTotal, `/proc/meminfo`
-  has a realistic field count, …). Pure — no network or host needed. The
-  CLI exits non-zero if any fail, so it slots straight into CI.
-- **Coverage** — what fraction of a 34-command recon corpus the
+  has a realistic field count, root device consistent across
+  `mount`/`/proc/mounts`/`df`, `sshd:22` consistent across `ss`/`netstat`,
+  `top -bn1` memory matches the persona, …). Pure — no network or host
+  needed. The CLI exits non-zero if any fail, so it slots straight into CI
+  (a `tox -e fidelity` env and a dedicated workflow job run it on every PR).
+- **Coverage** — what fraction of a 44-command recon corpus the
   deterministic layer answers locally (currently 100% across all six
   personas) vs. defers to the LLM.
 - **Reference** (`--reference local`, opt-in) — structural similarity of
@@ -288,6 +297,14 @@ coverage report --include='*/cowrie/llm/*'
   becoming an unintentional credential tester. The LLM narrates the
   attempt as "Permission denied (publickey,password)." — consistent
   with how a real locked-down sshd would respond.
+- **Full-screen interactive programs defer to the LLM.** Bounded/batch
+  forms are rendered deterministically and correctly — `top -bn1`,
+  `ping -c N`, `vmstat` — because those exit on their own. But truly
+  interactive, TTY-grabbing programs (`vim`, `nano`, `htop`, bare `top`,
+  `less`, `watch`) can't be faithfully emulated in the line-oriented
+  protocol, so they fall through to the LLM, which the hardened prompt
+  instructs to render a realistic initial frame. A skilled human driving a
+  real PTY can still tell; automated tooling generally can't.
 - **Streaming responses are off by default.** Anthropic providers
   support it (`[llm] stream = true`); enabling it makes responses
   drip to the terminal rather than appear in one block, which is

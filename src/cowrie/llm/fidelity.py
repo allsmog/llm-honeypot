@@ -61,6 +61,16 @@ RECON_CORPUS: tuple[tuple[str, str], ...] = (
     ("env", "echo $PATH"),
     ("net", "cat /etc/resolv.conf"),
     ("net", "hostname -I"),
+    ("net", "ss -tlnp"),
+    ("net", "netstat -tlnp"),
+    ("storage", "df"),
+    ("storage", "df -h"),
+    ("storage", "mount"),
+    ("storage", "cat /proc/mounts"),
+    ("monitor", "top -bn1"),
+    ("monitor", "vmstat"),
+    ("cron", "crontab -l"),
+    ("cron", "cat /etc/crontab"),
     ("time", "date"),
     ("which", "which python3"),
     ("which", "which curl"),
@@ -73,6 +83,7 @@ SAFE_REFERENCE_COMMANDS: tuple[str, ...] = (
     "whoami", "id", "uname -a", "uname -r", "uname -m", "arch", "nproc",
     "uptime", "hostname", "free", "date", "groups", "env",
     "cat /proc/cpuinfo", "cat /proc/meminfo", "cat /etc/os-release",
+    "df", "df -h", "vmstat", "cat /proc/mounts",
 )
 
 
@@ -230,6 +241,32 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
         "os-release ID matches persona family",
         any(tok in osr for tok in expected_id),
         f"family={p.family}",
+    )
+
+    # Storage: mount and /proc/mounts and df agree on the root device.
+    mount = _out(ctx, "mount") or ""
+    procmounts = _out(ctx, "cat /proc/mounts") or ""
+    df = _out(ctx, "df") or ""
+    check(
+        "root device consistent across mount/proc/df",
+        "/dev/vda1 on / type ext4" in mount
+        and "/dev/vda1 / ext4" in procmounts
+        and "/dev/vda1" in df,
+    )
+
+    # Network: ss and netstat both report sshd listening on :22.
+    ss = _out(ctx, "ss -tlnp") or ""
+    netstat = _out(ctx, "netstat -tlnp") or ""
+    check(
+        "sshd:22 consistent across ss and netstat",
+        ":22" in ss and "sshd" in ss and "0.0.0.0:22" in netstat and "sshd" in netstat,
+    )
+
+    # top -bn1 memory total agrees with the persona (and thus free).
+    top = _out(ctx, "top -bn1") or ""
+    check(
+        "top -bn1 mem total matches persona",
+        f"{p.memtotal_kb / 1024.0:9.1f} total" in top,
     )
 
     # Repeated calls are stable (no per-turn drift in derived values).
