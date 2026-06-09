@@ -150,7 +150,9 @@ class TestResources(unittest.TestCase):
         ctx = _ctx("ubuntu_22_04")
         total_kb = ctx.persona.memtotal_kb
         meminfo = R.respond("cat /proc/meminfo", ctx).output
-        self.assertIn(f"MemTotal:       {total_kb:>10} kB", meminfo)
+        self.assertIn(f"{'MemTotal:':<16}{total_kb:>8} kB", meminfo)
+        # Real /proc/meminfo is ~54 lines; a short render is fingerprintable.
+        self.assertGreaterEqual(meminfo.count("\n"), 40)
         free_k = R.respond("free", ctx).output
         # `free` default unit is kB; total appears verbatim.
         self.assertIn(str(total_kb), free_k)

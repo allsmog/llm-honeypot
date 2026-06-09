@@ -209,11 +209,11 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## Test coverage
 
-218 trial tests across 11 files under `src/cowrie/test/test_llm_*.py`,
+237 trial tests across 12 files under `src/cowrie/test/test_llm_*.py`,
 all green (2 skipped on optional deps). The deterministic responder,
-persona, WorldState, command parser, and prompt contract are heavily
-covered; the new `test_llm_responder.py` alone has 80 cases asserting
-per-distro file behavior, cross-command consistency (`id` vs
+persona, WorldState, command parser, prompt contract, and fidelity
+harness are heavily covered; `test_llm_responder.py` alone has 80 cases
+asserting per-distro file behavior, cross-command consistency (`id` vs
 `/etc/passwd`, `nproc` vs `/proc/cpuinfo`), the su/sudo effective-user
 flow, and graceful deferral of anything not modeled.
 
@@ -223,7 +223,8 @@ flow, and graceful deferral of anything not modeled.
 | `prompts.py` | 100% |
 | `worldstate.py` | 98% |
 | `cmd_parser.py` | 93% |
-| `responder.py` | 91% |
+| `responder.py` | 93% |
+| `fidelity.py` | 93% |
 | `providers/streaming.py` | 92% |
 | `providers/codex_apikey.py` | 90% |
 | `providers/anthropic_apikey.py` | 88% |
@@ -234,6 +235,33 @@ flow, and graceful deferral of anything not modeled.
 | `providers/anthropic_oauth.py` | 61% |
 | `providers/base.py` | 58% |
 | `llm.py` | 31% |
+
+## Fidelity evaluation
+
+`scripts/fidelity_eval.py` (logic in `cowrie/llm/fidelity.py`) scores the
+deterministic responder on the two believability axes the honeypot
+literature uses, and doubles as a CI regression gate:
+
+- **Consistency** — 16 cross-command / against-persona invariants that
+  must hold (`uname -r` ⊂ `uname -a`, `nproc` == `/proc/cpuinfo` block
+  count, `id www-data` == `/etc/passwd` uid 33, `hostname` ==
+  `/etc/hostname`, `free` total == `/proc/meminfo` MemTotal, `/proc/meminfo`
+  has a realistic field count, …). Pure — no network or host needed. The
+  CLI exits non-zero if any fail, so it slots straight into CI.
+- **Coverage** — what fraction of a 34-command recon corpus the
+  deterministic layer answers locally (currently 100% across all six
+  personas) vs. defers to the LLM.
+- **Reference** (`--reference local`, opt-in) — structural similarity of
+  the honeypot's output to the **real host shell** after masking volatile
+  tokens (hostnames, IPs, hashes, numbers, column widths). Only a hardcoded
+  allowlist of read-only commands is ever run on the host — never an
+  attacker payload. This is how the thin 12-line `/proc/meminfo` render was
+  caught and expanded to the full 54-field set (an attacker `wc -l` tell).
+
+```bash
+PYTHONPATH=src python scripts/fidelity_eval.py --all-personas
+PYTHONPATH=src python scripts/fidelity_eval.py --reference local
+```
 
 The Twisted glue files (`avatar.py`, `realm.py`, `server.py`,
 `session.py`, `telnet.py`) are at 0% in trial — they're integration

@@ -464,20 +464,49 @@ def _proc_cpuinfo(ctx) -> str:
 def _proc_meminfo(ctx) -> str:
     m = _mem_breakdown(ctx)
     swap = ctx.persona.memtotal_kb
-    return (
-        f"MemTotal:       {m['total']:>10} kB\n"
-        f"MemFree:        {m['free']:>10} kB\n"
-        f"MemAvailable:   {m['available']:>10} kB\n"
-        f"Buffers:        {m['buffers']:>10} kB\n"
-        f"Cached:         {m['cached']:>10} kB\n"
-        f"SwapCached:     {0:>10} kB\n"
-        f"Active:         {int(m['used'] * 0.6):>10} kB\n"
-        f"Inactive:       {int(m['cached'] * 0.7):>10} kB\n"
-        f"SwapTotal:      {swap:>10} kB\n"
-        f"SwapFree:       {swap:>10} kB\n"
-        f"Dirty:          {120:>10} kB\n"
-        f"Shmem:          {m['shared']:>10} kB\n"
-    )
+    used = m["used"]
+    cached = m["cached"]
+    # Full modern /proc/meminfo field set — a real one is ~54 lines, so a
+    # 12-line render is trivially fingerprintable via `wc -l`. Load-bearing
+    # fields (MemTotal/Free/Available/Buffers/Cached/Swap*) stay consistent
+    # with `free`; the rest are plausible, seed-stable fillers.
+    anon = int(used * 0.55)
+    active = int(used * 0.62)
+    inactive = int(cached * 0.70)
+    slab = int(m["total"] * 0.03)
+    sreclaim = int(slab * 0.7)
+    rows = [
+        ("MemTotal", m["total"]), ("MemFree", m["free"]),
+        ("MemAvailable", m["available"]), ("Buffers", m["buffers"]),
+        ("Cached", cached), ("SwapCached", 0),
+        ("Active", active), ("Inactive", inactive),
+        ("Active(anon)", int(anon * 0.6)), ("Inactive(anon)", int(anon * 0.1)),
+        ("Active(file)", int(active * 0.5)), ("Inactive(file)", inactive),
+        ("Unevictable", 19000 % (m["total"] or 1)), ("Mlocked", 18000 % (m["total"] or 1)),
+        ("SwapTotal", swap), ("SwapFree", swap), ("Zswap", 0), ("Zswapped", 0),
+        ("Dirty", 144), ("Writeback", 0), ("AnonPages", anon),
+        ("Mapped", int(cached * 0.2)), ("Shmem", m["shared"]),
+        ("KReclaimable", sreclaim), ("Slab", slab),
+        ("SReclaimable", sreclaim), ("SUnreclaim", slab - sreclaim),
+        ("KernelStack", 4096), ("PageTables", int(used * 0.01)),
+        ("SecPageTables", 0), ("NFS_Unstable", 0), ("Bounce", 0),
+        ("WritebackTmp", 0), ("CommitLimit", int(m["total"] * 1.5)),
+        ("Committed_AS", int(used * 1.3)), ("VmallocTotal", 34359738367),
+        ("VmallocUsed", 28000), ("VmallocChunk", 0), ("Percpu", 1024),
+        ("HardwareCorrupted", 0), ("AnonHugePages", 0), ("ShmemHugePages", 0),
+        ("ShmemPmdMapped", 0), ("FileHugePages", 0), ("FilePmdMapped", 0),
+        ("HugePages_Total", 0), ("HugePages_Free", 0), ("HugePages_Rsvd", 0),
+        ("HugePages_Surp", 0), ("Hugepagesize", 2048), ("Hugetlb", 0),
+        ("DirectMap4k", int(m["total"] * 0.05)),
+        ("DirectMap2M", int(m["total"] * 0.95)), ("DirectMap1G", 0),
+    ]
+    lines = []
+    for name, val in rows:
+        # HugePages_* counts are unit-less; the rest are " kB".
+        unit = "" if name.startswith("HugePages_") else " kB"
+        label = f"{name}:"
+        lines.append(f"{label:<16}{val:>8}{unit}")
+    return "\n".join(lines) + "\n"
 
 
 def _proc_loadavg(ctx) -> str:
