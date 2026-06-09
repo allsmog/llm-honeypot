@@ -16,12 +16,22 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import cmd_parser
-from cowrie.llm import downloader
-from cowrie.llm.llm import LLMClient
+from cowrie.llm import cmd_parser, downloader
 from cowrie.llm import persona as personamod
+from cowrie.llm import prompts as promptmod
+from cowrie.llm import responder as respondermod
+from cowrie.llm.llm import LLMClient
 from cowrie.llm.providers.base import LLMMessage, LLMRequest
 from cowrie.llm.worldstate import WorldState
+
+
+class _DefaultingMap(dict):
+    """dict for str.format_map that returns "" for unknown keys instead of
+    raising KeyError — so an operator's custom system_prompt template can
+    reference a variable we don't supply without crashing the session."""
+
+    def __missing__(self, key):
+        return ""
 
 
 def strip_markdown(text: str) -> str:
@@ -176,9 +186,66 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # still narrates the command's terminal output; WorldState just
         # keeps the picture consistent across turns.
         self._apply_input_mutations(string)
+        # Deterministic responder: identity/info commands (whoami, uname,
+        # free, cat /etc/os-release, ps, ...) are rendered from the pinned
+        # persona + WorldState instead of the LLM. Instant (no model round
+        # trip → fixes the timing fingerprint), perfectly consistent across
+        # turns, and free. Unrecognized commands return None and fall
+        # through to the download interceptor / LLM unchanged.
+        if self._try_deterministic(string):
+            return
         if self._try_download_intercept(string):
             return
         self._process_command_with_llm(string)
+
+    def _try_deterministic(self, command: str) -> bool:
+        """Render ``command`` from local state if we can. Returns True iff
+        handled (output written + prompt shown), False to fall through."""
+        if not CowrieConfig.getboolean(
+            "llm", "deterministic_responses", fallback=True
+        ):
+            return False
+        ctx = self._shell_context()
+        result = respondermod.respond(command, ctx)
+        if result is None:
+            return False
+        # Count toward neither the LLM budget nor the LLM history — these
+        # are pure local renders. They are derived from facts already in
+        # the persona/WorldState, so the LLM stays consistent with them.
+        log.msg(
+            eventid="cowrie.llm.deterministic",
+            input=command,
+            cwd=self.cwd,
+            sessionno=f"S{self.sessionno}",
+            format="deterministic: %(input)s",
+        )
+        if self.terminal is not None and result.output:
+            self.terminal.write(result.output.encode("utf-8"))
+        jitter_min = CowrieConfig.getint("llm", "fastpath_jitter_ms_min", fallback=5)
+        jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
+        self._show_prompt(jitter_min, jitter_max)
+        return True
+
+    def _shell_context(self) -> respondermod.ShellContext:
+        """Snapshot the session state the deterministic responder needs."""
+        return respondermod.ShellContext(
+            persona=self.persona,
+            boot_time=self.boot_time,
+            world=self.world,
+            cwd=self.cwd,
+            login_user=self.user.username,
+            hostname=self.hostname,
+            server_ip=getattr(self, "kippoIP", ""),
+            client_ip=getattr(self, "clientIP", ""),
+            seed=f"{getattr(self, 'realClientIP', '')}|{self.boot_time}",
+        )
+
+    def _effective_user(self) -> str:
+        """Top of the su/sudo stack, or the login user."""
+        world = getattr(self, "world", None)
+        if world is not None:
+            return world.effective_user(self.user.username)
+        return self.user.username
 
     def _apply_input_mutations(self, command: str) -> None:
         for m in cmd_parser.parse_input_mutations(command):
@@ -226,6 +293,16 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             elif m.kind == "set_env":
                 if m.env_name:
                     self.world.add_env(m.env_name, m.env_value or "")
+            elif m.kind == "push_user":
+                if m.user:
+                    self.world.push_user(m.user)
+            elif m.kind == "pop_user":
+                self.world.pop_user()
+            elif m.kind == "add_process":
+                if m.proc_command:
+                    self.world.add_process(
+                        m.proc_command, user=self._effective_user()
+                    )
 
     def _try_download_intercept(self, command: str) -> bool:
         """If the command is a wget/curl/tftp/ftpget, fetch first then
@@ -294,6 +371,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         rest = parts[1] if len(parts) > 1 else ""
 
         if head in ("exit", "logout", "quit"):
+            # If we're inside a su / sudo subshell, `exit` returns to the
+            # parent shell rather than closing the connection — pop the
+            # effective-user stack and re-prompt as the prior user.
+            world = getattr(self, "world", None)
+            if world is not None and world.user_stack:
+                world.pop_user()
+                self._show_prompt(jitter_min, jitter_max)
+                return True
             if self.terminal is not None:
                 self.terminal.loseConnection()
             return True
@@ -351,36 +436,30 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         For exec commands a tighter default is used to suppress conversational output.
         """
         if exec_command:
-            default = (
-                "You are simulating a Linux server that has been accessed via SSH "
-                "with a command to execute. "
-                "Respond with ONLY the output that would be displayed after executing this command. "
-                "Keep responses realistic, including appropriate error messages for invalid commands."
-            )
+            default = promptmod.EXEC_SYSTEM_PROMPT
             config_key = "system_prompt_exec"
         else:
-            default = (
-                "You are simulating a Linux server that has been accessed via SSH. "
-                "Respond as if you were the shell on this system. "
-                "Your response should be the output that would be displayed after executing the command. "
-                "Keep responses realistic, including appropriate error messages for invalid commands. "
-                "For file paths, maintain consistent state with previous commands."
-            )
+            default = promptmod.INTERACTIVE_SYSTEM_PROMPT
             config_key = "system_prompt"
 
         template = CowrieConfig.get("llm", config_key, fallback=default)
+        # Effective user reflects su/sudo so the prompt's persona matches the
+        # WorldState's user stack across turns.
+        username = self._effective_user() if not exec_command else self.user.username
         context = template.format_map(
-            {
-                "hostname": self.hostname,
-                "username": self.user.username,
-                "ip": getattr(self, "kippoIP", ""),
-                "ip6": getattr(self, "kippoIPv6", ""),
-                "client_ip": getattr(self, "clientIP", ""),
-                "cwd": self.cwd,
-            }
+            _DefaultingMap(
+                {
+                    "hostname": self.hostname,
+                    "username": username,
+                    "ip": getattr(self, "kippoIP", ""),
+                    "ip6": getattr(self, "kippoIPv6", ""),
+                    "client_ip": getattr(self, "clientIP", ""),
+                    "cwd": self.cwd,
+                }
+            )
         )
         context += (
-            f" The hostname is '{self.hostname}' and username is '{self.user.username}'."
+            f" The hostname is '{self.hostname}' and username is '{username}'."
             f" The current working directory is '{self.cwd}'."
         )
         # Pin distro/kernel/uptime/cpu/memory so identity-probe commands
@@ -455,9 +534,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         mutable_tail = self.world.to_prompt_section() if hasattr(self, "world") else ""
 
         # Reconstruct conversation messages from command_history (assistant
-        # turns prefixed "System:", user turns "User:").
+        # turns prefixed "System:", user turns "User:"). The recency window
+        # is configurable: durable session facts (files, env, processes,
+        # user stack) live in WorldState's prompt tail — Anthropic's
+        # "structured notes outside the context window" pattern — so a
+        # modest window stays coherent without re-sending the whole session.
+        window = CowrieConfig.getint("llm", "history_window_turns", fallback=16)
         request_messages: list[LLMMessage] = []
-        for raw in self.command_history[-10:]:
+        for raw in self.command_history[-window:]:
             if raw.startswith("User:"):
                 request_messages.append(
                     LLMMessage(role="user", content=raw[len("User:") :].strip())
@@ -466,6 +550,11 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 request_messages.append(
                     LLMMessage(role="assistant", content=raw[len("System:") :].strip())
                 )
+        # The Messages API requires the first turn to be `user`. A window
+        # that slices mid-pair can leave a leading assistant turn — drop any
+        # leading assistant messages so the request is always valid.
+        while request_messages and request_messages[0].role == "assistant":
+            request_messages.pop(0)
 
         request = LLMRequest(
             system_blocks=[(stable_head, True), (mutable_tail, False)],
@@ -592,21 +681,26 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         max_jitter = max(0, jitter_max_ms)
         min_jitter = max(0, min(jitter_min_ms, max_jitter))
         if max_jitter > 0:
-            from twisted.internet import reactor
             import random
+
+            from twisted.internet import reactor
             delay_ms = random.randint(min_jitter, max_jitter)
             reactor.callLater(delay_ms / 1000.0, self._write_prompt_safe)
             return
         self._write_prompt_safe()
 
     def _write_prompt_safe(self) -> None:
-        """Write the prompt unless the terminal is gone (post-disconnect)."""
+        """Write the prompt unless the terminal is gone (post-disconnect).
+
+        Uses the *effective* user (top of the su/sudo stack) so the prompt
+        and the `#`/`$` sigil change when an attacker `su`'s to root and
+        back — a detail real shells get right and many honeypots don't.
+        """
         if self.terminal is None:
             return
-        if self.user.username == "root":
-            prompt = f"{self.user.username}@{self.hostname}:{self.cwd}# "
-        else:
-            prompt = f"{self.user.username}@{self.hostname}:{self.cwd}$ "
+        user = self._effective_user()
+        sigil = "#" if user == "root" else "$"
+        prompt = f"{user}@{self.hostname}:{self.cwd}{sigil} "
         self.terminal.write(prompt.encode("utf-8"))
 
     def uptime(self):

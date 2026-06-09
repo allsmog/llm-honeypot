@@ -25,7 +25,6 @@ from cowrie.llm.providers.base import LLMRequest
 from cowrie.test.fake_server import FakeAvatar, FakeServer
 from cowrie.test.fake_transport import FakeTransport
 
-
 # ----------------------------------------------------------------------
 # Stubs
 
@@ -161,7 +160,8 @@ class TestFastpath(unittest.TestCase):
         """When jitter > 0, the prompt write must be deferred via
         reactor.callLater rather than synchronous. Verifies the
         anti-fingerprinting jitter is wired correctly."""
-        from twisted.internet import reactor as _reactor, task
+        from twisted.internet import reactor as _reactor
+        from twisted.internet import task
         clock = task.Clock()
         self.patch(_reactor, "callLater", clock.callLater)
         self.tr.clear()
@@ -223,8 +223,9 @@ class TestCommandCap(unittest.TestCase):
     def test_cap_stops_llm_calls_after_threshold(self):
         # 5 LLM-bound commands with cap=3 → provider stub should be
         # called 3 times and the 4th/5th get the canned fork error.
+        # `ls` is not deterministic, so it routes to the LLM.
         for _ in range(5):
-            self.proto.lineReceived(b"whoami")
+            self.proto.lineReceived(b"ls")
         self.assertEqual(len(self.stub.calls), 3)
         # The 4th and 5th commands should have written the fork error.
         self.assertIn(b"cannot fork", self.tr.value())
@@ -233,11 +234,19 @@ class TestCommandCap(unittest.TestCase):
         # 3 LLM commands fill the budget; then 2 fastpath calls should
         # still complete normally without triggering the cap.
         for _ in range(3):
-            self.proto.lineReceived(b"whoami")
+            self.proto.lineReceived(b"ls")
         self.assertEqual(len(self.stub.calls), 3)
         self.proto.lineReceived(b"pwd")
         self.proto.lineReceived(b"cd /tmp")
         self.assertEqual(len(self.stub.calls), 3)  # unchanged
+
+    def test_deterministic_commands_do_not_consume_budget(self):
+        # Deterministic commands (whoami) never reach the LLM, so they must
+        # not count against the per-session LLM budget either.
+        for _ in range(10):
+            self.proto.lineReceived(b"whoami")
+        self.assertEqual(len(self.stub.calls), 0)
+        self.assertNotIn(b"cannot fork", self.tr.value())
 
 
 # ----------------------------------------------------------------------
@@ -330,6 +339,89 @@ class TestObservationInjection(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# Deterministic responder integration
+
+
+class TestDeterministicPath(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+
+    def tearDown(self) -> None:
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_whoami_renders_without_llm(self):
+        self.proto.user.username = "root"
+        self.tr.clear()
+        self.proto.lineReceived(b"whoami")
+        self.assertEqual(len(self.stub.calls), 0)
+        self.assertIn(b"root", self.tr.value())
+
+    def test_uname_r_matches_persona(self):
+        self.tr.clear()
+        self.proto.lineReceived(b"uname -r")
+        self.assertEqual(len(self.stub.calls), 0)
+        self.assertIn(self.proto.persona.kernel.encode(), self.tr.value())
+
+    def test_disabling_deterministic_routes_to_llm(self):
+        from cowrie.core.config import CowrieConfig
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        CowrieConfig.set("llm", "deterministic_responses", "false")
+        self.addCleanup(
+            lambda: CowrieConfig.remove_option("llm", "deterministic_responses")
+        )
+        self.tr.clear()
+        self.proto.lineReceived(b"whoami")
+        # With the deterministic layer off, whoami goes to the LLM.
+        self.assertEqual(len(self.stub.calls), 1)
+
+
+class TestSuFlow(unittest.TestCase):
+    """su/sudo changes the effective user, the prompt sigil, and exit pops."""
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+        self.proto.user.username = "deploy"
+
+    def tearDown(self) -> None:
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_su_root_changes_effective_user_and_prompt(self):
+        # su to root: whoami (deterministic) should now say root, and the
+        # prompt sigil should flip from $ to #.
+        self.proto.lineReceived(b"su -")
+        self.assertEqual(self.proto._effective_user(), "root")
+        self.tr.clear()
+        self.proto.lineReceived(b"whoami")
+        self.assertIn(b"root", self.tr.value())
+        # Prompt now ends with '# ' (root).
+        self.assertIn(b"deploy" if False else b"@", self.tr.value())
+        self.assertIn(b"# ", self.tr.value())
+
+    def test_exit_pops_su_then_closes(self):
+        self.proto.lineReceived(b"su -")
+        self.assertEqual(self.proto._effective_user(), "root")
+        # First exit returns to the deploy shell (does not disconnect).
+        self.tr.clear()
+        self.proto.lineReceived(b"exit")
+        self.assertEqual(self.proto._effective_user(), "deploy")
+        self.assertIn(b"$ ", self.tr.value())  # back to non-root prompt
+
+    def test_backgrounded_command_recorded_as_process(self):
+        # `cmd &` records a process that ps will later reflect.
+        self.proto.lineReceived(b"nohup python3 miner.py &")
+        cmds = [p.command for p in self.proto.world.processes.values()]
+        self.assertIn("python3 miner.py", cmds)
+
+
+# ----------------------------------------------------------------------
 # Marker-leak guard
 
 
@@ -343,8 +435,8 @@ class TestObservationLeakStrip(unittest.TestCase):
         )
         proto, tr, _ = _make_protocol(llm_response=leaky)
         self.addCleanup(lambda: _safe_cancel_timeout(proto))
-        # Drive any command that hits the LLM path.
-        proto.lineReceived(b"whoami")
+        # Drive a command that hits the LLM path (ls is not deterministic).
+        proto.lineReceived(b"ls -la /var/www")
         rendered = tr.value().decode("utf-8", errors="replace")
         self.assertNotIn("[SHELL_OBSERVED]", rendered)
         self.assertNotIn("[/SHELL_OBSERVED]", rendered)

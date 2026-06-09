@@ -29,6 +29,18 @@ class Persona:
     # Short, plausible package list. Used to anchor `dpkg -l` / `rpm -qa`
     # / `apk info` style probes.
     installed_packages: tuple[str, ...] = field(default_factory=tuple)
+    # Logical CPU count — must agree across `nproc`, `/proc/cpuinfo`
+    # (one block per cpu), `lscpu`, and the `top`/`uptime` load line.
+    ncpus: int = 1
+    # CPU MHz reported in /proc/cpuinfo and lscpu. Cosmetic but pinned
+    # so repeated probes don't drift.
+    cpu_mhz: float = 2400.0
+    # Family of the init system: drives pid 1 in `ps` output and the
+    # service-manager probes. "systemd" for modern distros, "busybox"
+    # for Alpine, "sysvinit" for CentOS 7.
+    init_system: str = "systemd"
+    # Distro family — anchors which package manager / paths are plausible.
+    family: str = "debian"  # debian | rhel | alpine
 
 
 PERSONAS: tuple[Persona, ...] = (
@@ -46,6 +58,10 @@ PERSONAS: tuple[Persona, ...] = (
             "python3-pip", "git", "ca-certificates", "openssl", "iproute2",
             "net-tools", "iputils-ping", "less", "rsync", "ufw", "cron",
         ),
+        ncpus=2,
+        cpu_mhz=2400.06,
+        init_system="systemd",
+        family="debian",
     ),
     Persona(
         slug="ubuntu_20_04",
@@ -61,6 +77,10 @@ PERSONAS: tuple[Persona, ...] = (
             "python3-pip", "git", "ca-certificates", "openssl",
             "net-tools", "iputils-ping", "less", "ufw",
         ),
+        ncpus=1,
+        cpu_mhz=2599.99,
+        init_system="systemd",
+        family="debian",
     ),
     Persona(
         slug="debian_12",
@@ -76,6 +96,10 @@ PERSONAS: tuple[Persona, ...] = (
             "git", "ca-certificates", "openssl", "iproute2",
             "iputils-ping", "less", "rsync", "nftables",
         ),
+        ncpus=4,
+        cpu_mhz=2194.84,
+        init_system="systemd",
+        family="debian",
     ),
     Persona(
         slug="debian_11",
@@ -91,6 +115,10 @@ PERSONAS: tuple[Persona, ...] = (
             "git", "ca-certificates", "openssl", "net-tools",
             "iputils-ping", "less",
         ),
+        ncpus=1,
+        cpu_mhz=2599.98,
+        init_system="systemd",
+        family="debian",
     ),
     Persona(
         slug="centos_7",
@@ -106,6 +134,10 @@ PERSONAS: tuple[Persona, ...] = (
             "python3", "git", "ca-certificates", "openssl", "iproute",
             "iputils", "less", "firewalld",
         ),
+        ncpus=2,
+        cpu_mhz=2399.96,
+        init_system="sysvinit",
+        family="rhel",
     ),
     Persona(
         slug="alpine_3_19",
@@ -120,6 +152,10 @@ PERSONAS: tuple[Persona, ...] = (
             "openssh", "curl", "wget", "busybox", "musl", "python3",
             "ca-certificates", "openssl",
         ),
+        ncpus=1,
+        cpu_mhz=2445.40,
+        init_system="busybox",
+        family="alpine",
     ),
 )
 

@@ -505,15 +505,43 @@ log_raw = false
 # (default: false)
 #debug = false
 
+# Deterministic responder. Identity / info commands (whoami, id, uname,
+# hostname, nproc, uptime, free, lscpu, ps, env, echo, which, date, w, and
+# cat of /etc/os-release, /etc/passwd, /proc/cpuinfo, /proc/meminfo, ...)
+# are rendered locally from the pinned persona + per-session WorldState
+# instead of the LLM. This is the single biggest believability win:
+#   - timing: returns in microseconds (+jitter) like real bash, instead of
+#     the ~300-500ms model round-trip that timing-analysis fingerprints,
+#   - consistency: the same facts every turn, derived from the same pinned
+#     persona the LLM sees, so `id www-data` and `cat /etc/passwd` agree,
+#   - cost: zero API calls for the most common probe commands.
+# Unrecognized commands fall through to the LLM unchanged. Set false to
+# route everything through the model (closer to upstream behavior).
+# (default: true)
+#deterministic_responses = true
+
+# Conversation recency window (number of past turns replayed to the LLM
+# each request). Durable session facts (downloaded files, env vars,
+# background processes, su/sudo user stack) live in the WorldState prompt
+# tail regardless of this window, so a modest value stays coherent while
+# bounding per-turn token cost. Deterministic-responder turns don't count.
+# (default: 16)
+#history_window_turns = 16
+
 # System prompt template for interactive SSH sessions.
 # Supports variables: {hostname}, {username}, {ip}, {ip6}, {client_ip}, {cwd}
 # Note: hostname, username and cwd are always appended automatically.
-# (default: built-in Linux shell simulation prompt)
+# The built-in default is a hardened behavioral contract (output discipline,
+# error fidelity, ground-truth consistency, never-break-character, realistic
+# interactive-program handling). Overriding it weakens believability unless
+# your template is at least as strict; leave unset to use the built-in.
+# (default: cowrie.llm.prompts.INTERACTIVE_SYSTEM_PROMPT)
 #system_prompt = You are simulating a Linux server at {ip} ({ip6}) accessed via SSH. Respond as if you were the shell on this system. Your response should be the output that would be displayed after executing the command. Keep responses realistic, including appropriate error messages for invalid commands. For file paths, maintain consistent state with previous commands.
 
 # System prompt template for non-interactive exec commands (e.g. ssh host 'cmd').
 # Same variables supported. Defaults to a tighter prompt that suppresses
 # conversational output and asks for raw command output only.
+# (default: cowrie.llm.prompts.EXEC_SYSTEM_PROMPT)
 #system_prompt_exec = You are simulating a Linux server. Respond with ONLY the raw output of the command, no commentary.
 
 

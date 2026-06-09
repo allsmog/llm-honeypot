@@ -123,10 +123,47 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## What the fork adds beyond the provider abstraction
 
+- **Deterministic responder for identity/info commands.** The single
+  biggest believability win. `whoami`, `id`, `groups`, `hostname`, `uname`
+  (all flag forms), `arch`, `nproc`, `uptime`, `free`, `lscpu`, `ps`
+  (`aux`/`-ef`/bare), `env`/`printenv`, `echo` (with `$VAR` expansion),
+  `which`/`command -v`, `date`, `w`, and `cat` of `/etc/os-release`,
+  `/etc/passwd`, `/etc/group`, `/etc/shadow`, `/proc/cpuinfo`,
+  `/proc/meminfo`, `/proc/loadavg`, `/etc/hostname`, … are rendered
+  locally from the pinned persona + per-session WorldState in
+  `cowrie/llm/responder.py` — never the model. This closes three honeypot
+  fingerprints at once that the 2025 SoK on honeypots+LLMs calls out:
+  **timing** (microsecond response with jitter, instead of the ~300–500ms
+  model round-trip a scanner can time), **consistency** (the same facts
+  every turn, derived from the same persona the LLM sees — `id www-data`
+  and `cat /etc/passwd` always agree on uid 33; `nproc` matches the
+  `/proc/cpuinfo` block count), and **cost** (zero API calls for the most
+  common probe commands). Anything unrecognized — and any file the session
+  has actually modified — falls through to the LLM unchanged. Toggle with
+  `[llm] deterministic_responses` (default on).
+- **Hardened system prompt.** `cowrie/llm/prompts.py` replaces the old
+  two-sentence "simulate a Linux server" default with an explicit
+  behavioral contract: output discipline (stdout/stderr bytes only, no
+  markdown/preamble/prompt-echo), error fidelity (real `command not found`
+  / `No such file or directory` / `Permission denied` wording),
+  ground-truth consistency against the pinned facts + WorldState,
+  never-break-character under social-engineering, and realistic handling
+  of full-screen/continuous programs (`top`, `vim`, `tail -f`). Overridable
+  via `[llm] system_prompt` / `system_prompt_exec`.
+- **Effective-user tracking (su/sudo).** `su`, `su - user`, `sudo -i`,
+  `sudo su -`, `sudo -u user …` push an effective-user stack in WorldState.
+  `whoami`/`id` and the shell prompt (including the `$`→`#` sigil) reflect
+  the top of the stack, and `exit` pops back to the parent shell instead of
+  closing the connection — a detail real shells get right and most
+  honeypots don't.
+- **Background-process tracking.** `cmd &` / `nohup cmd &` registers a PID
+  in WorldState; `ps` reflects launched payloads and the LLM prompt carries
+  them so narration stays consistent across turns.
 - **Fastpath for trivial commands.** `exit`/`logout`/`quit`, `cd`, `pwd`,
   `clear`, and empty input are handled in `lineReceived` without an LLM
-  round-trip. `exit` actually exits, `cd` updates `self.cwd` so the next
-  LLM turn sees consistent state. Cuts per-session latency and cost.
+  round-trip. `exit` actually exits (or pops an su subshell), `cd` updates
+  `self.cwd` so the next LLM turn sees consistent state. Cuts per-session
+  latency and cost.
 - **LLM-turn logging.** Every command emits `cowrie.llm.prompt` and
   `cowrie.llm.response` events to the JSON log with `latency_ms`. Errors
   log `cowrie.llm.error`. All carry the session id so they correlate with
@@ -172,20 +209,27 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## Test coverage
 
-108 trial tests across 9 files under `src/cowrie/test/test_llm_*.py`,
-all green (2 skipped on optional deps). Logic-module coverage:
+218 trial tests across 11 files under `src/cowrie/test/test_llm_*.py`,
+all green (2 skipped on optional deps). The deterministic responder,
+persona, WorldState, command parser, and prompt contract are heavily
+covered; the new `test_llm_responder.py` alone has 80 cases asserting
+per-distro file behavior, cross-command consistency (`id` vs
+`/etc/passwd`, `nproc` vs `/proc/cpuinfo`), the su/sudo effective-user
+flow, and graceful deferral of anything not modeled.
 
 | Module | Coverage |
 |---|---|
 | `persona.py` | 100% |
-| `cmd_parser.py` | 97% |
-| `worldstate.py` | 93% |
+| `prompts.py` | 100% |
+| `worldstate.py` | 98% |
+| `cmd_parser.py` | 93% |
+| `responder.py` | 91% |
 | `providers/streaming.py` | 92% |
 | `providers/codex_apikey.py` | 90% |
 | `providers/anthropic_apikey.py` | 88% |
 | `providers/registry.py` | 88% |
+| `protocol.py` | 69% |
 | `providers/codex_oauth.py` | 65% |
-| `protocol.py` | 65% |
 | `downloader.py` | 61% |
 | `providers/anthropic_oauth.py` | 61% |
 | `providers/base.py` | 58% |
