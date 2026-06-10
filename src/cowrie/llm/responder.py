@@ -1304,6 +1304,71 @@ def _h_crontab(args, ctx, user):
     return None  # -e (edit) is interactive; -r (remove) is an action — defer
 
 
+def _resolve_path(arg: str, ctx) -> str:
+    """Resolve a possibly-relative path against the session cwd."""
+    if not arg or arg == ".":
+        return ctx.cwd
+    if arg == "~":
+        return _home_for(ctx.user)
+    if arg.startswith("~/"):
+        return _home_for(ctx.user) + arg[1:]
+    if arg.startswith("/"):
+        return arg
+    base = ctx.cwd.rstrip("/")
+    return f"{base}/{arg}" if base else f"/{arg}"
+
+
+def _h_ls(args, ctx, user):
+    from cowrie.llm import vfs as vfsmod
+
+    long_ = all_ = False
+    paths: list[str] = []
+    for a in args:
+        if a.startswith("--"):
+            if a == "--all":
+                all_ = True
+            elif a == "--almost-all":
+                all_ = True
+            # other long flags we don't model precisely -> defer
+            elif a not in ("--color=auto", "--color=always", "--color=never",
+                           "--color", "--group-directories-first"):
+                return None
+        elif a.startswith("-"):
+            for ch in a[1:]:
+                if ch == "l":
+                    long_ = True
+                elif ch in ("a", "A"):
+                    all_ = True
+                elif ch in ("h", "1", "F", "G", "p", "C", "x", "b"):
+                    pass  # cosmetic flags we can ignore
+                else:
+                    return None  # -R, -t, -S, etc. change ordering/recursion
+        else:
+            paths.append(a)
+    if len(paths) > 1:
+        return None  # multi-path ls has per-path headers — defer
+    target = _resolve_path(paths[0], ctx) if paths else ctx.cwd
+    vfs = vfsmod.VFS(ctx.world, ctx.login_user)
+    out = vfsmod.render_ls(vfs, target, long=long_, all_=all_, username=user)
+    if out is None:
+        return None
+    return ResponderResult(output=out)
+
+
+def _h_stat(args, ctx, user):
+    from cowrie.llm import vfs as vfsmod
+
+    positional = [a for a in args if not a.startswith("-")]
+    if len(positional) != 1:
+        return None
+    if any(a.startswith("-") and a not in ("--",) for a in args):
+        return None  # -c/-f format strings — defer
+    target = _resolve_path(positional[0], ctx)
+    vfs = vfsmod.VFS(ctx.world, ctx.login_user)
+    out = vfsmod.render_stat(vfs, target, username=user)
+    return ResponderResult(output=out) if out is not None else None
+
+
 # ----------------------------------------------------------------------
 # Dispatch table
 
@@ -1337,6 +1402,8 @@ _DISPATCH = {
     "ss": _h_ss,
     "netstat": _h_netstat,
     "crontab": _h_crontab,
+    "ls": _h_ls,
+    "stat": _h_stat,
 }
 
 

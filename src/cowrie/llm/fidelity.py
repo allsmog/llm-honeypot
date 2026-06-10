@@ -71,6 +71,10 @@ RECON_CORPUS: tuple[tuple[str, str], ...] = (
     ("monitor", "vmstat"),
     ("cron", "crontab -l"),
     ("cron", "cat /etc/crontab"),
+    ("fs", "ls /"),
+    ("fs", "ls -la /etc"),
+    ("fs", "ls -la /root"),
+    ("fs", "stat /etc/passwd"),
     ("time", "date"),
     ("which", "which python3"),
     ("which", "which curl"),
@@ -267,6 +271,27 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
     check(
         "top -bn1 mem total matches persona",
         f"{p.memtotal_kb / 1024.0:9.1f} total" in top,
+    )
+
+    # Filesystem coherence: a created file appears in `ls -l` and `stat`
+    # with the same size, and `ls` is stable across identical calls.
+    from cowrie.llm.worldstate import WorldState as _WS
+
+    probe = respondermod.ShellContext(
+        persona=p, boot_time=ctx.boot_time, world=_WS(), cwd="/root",
+        login_user=ctx.login_user, hostname=ctx.hostname, seed=ctx.seed,
+    )
+    probe.world.add_file(path="/tmp/fidelity_probe.bin", size_bytes=4242,
+                         source="downloaded")
+    ls_l = _out(probe, "ls -l /tmp") or ""
+    st = _out(probe, "stat /tmp/fidelity_probe.bin") or ""
+    check(
+        "ls -l and stat agree on created-file size",
+        "4242" in ls_l and "Size: 4242" in st,
+    )
+    check(
+        "ls is stable across identical calls",
+        _out(probe, "ls -la /tmp") == _out(probe, "ls -la /tmp"),
     )
 
     # Repeated calls are stable (no per-turn drift in derived values).

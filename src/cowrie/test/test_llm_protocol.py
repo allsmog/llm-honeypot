@@ -220,12 +220,15 @@ class TestCommandCap(unittest.TestCase):
         except Exception:
             pass
 
+    # A command that always routes to the LLM (cat of an unmodeled file is
+    # not in the deterministic responder's table).
+    LLM_CMD = b"cat /var/log/auth.log"
+
     def test_cap_stops_llm_calls_after_threshold(self):
         # 5 LLM-bound commands with cap=3 → provider stub should be
         # called 3 times and the 4th/5th get the canned fork error.
-        # `ls` is not deterministic, so it routes to the LLM.
         for _ in range(5):
-            self.proto.lineReceived(b"ls")
+            self.proto.lineReceived(self.LLM_CMD)
         self.assertEqual(len(self.stub.calls), 3)
         # The 4th and 5th commands should have written the fork error.
         self.assertIn(b"cannot fork", self.tr.value())
@@ -234,7 +237,7 @@ class TestCommandCap(unittest.TestCase):
         # 3 LLM commands fill the budget; then 2 fastpath calls should
         # still complete normally without triggering the cap.
         for _ in range(3):
-            self.proto.lineReceived(b"ls")
+            self.proto.lineReceived(self.LLM_CMD)
         self.assertEqual(len(self.stub.calls), 3)
         self.proto.lineReceived(b"pwd")
         self.proto.lineReceived(b"cd /tmp")

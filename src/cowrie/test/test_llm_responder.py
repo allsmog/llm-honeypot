@@ -53,8 +53,10 @@ class TestDefer(unittest.TestCase):
         # job-control output is the LLM's job; deterministic layer declines.
         self.assertIsNone(R.respond("ping example.com &", _ctx()))
 
-    def test_ls_defers(self):
-        self.assertIsNone(R.respond("ls -la", _ctx()))
+    def test_ls_unknown_dir_defers(self):
+        # ls of a directory we don't model falls through to the LLM.
+        self.assertIsNone(R.respond("ls -la /opt/vendor/secret", _ctx()))
+        self.assertIsNone(R.respond("ls -R /", _ctx()))  # recursive defers
 
     def test_interactive_defers(self):
         for cmd in ("vim /etc/passwd", "top", "htop", "less /var/log/syslog"):
