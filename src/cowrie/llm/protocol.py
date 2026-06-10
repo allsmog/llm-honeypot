@@ -16,7 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import attack_map, cmd_parser, downloader
+from cowrie.llm import attack_map, cmd_parser, downloader, scp
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
 from cowrie.llm import responder as respondermod
@@ -765,8 +765,95 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         HoneyPotBaseProtocol.connectionMade(self)
         self.setTimeout(60)
 
+        self._scp_sink = None
+        self._scp_finalized = False
+        self._emit_attack_techniques(self.execcmd)
+
+        # scp upload (`scp -t <path>`) rides a raw channel below the command
+        # layer — capture the real payload instead of refusing it.
+        if scp.is_scp_sink(self.execcmd):
+            self._begin_scp_sink()
+            return
+        if scp.is_scp_source(self.execcmd):
+            # Download FROM us: refuse (serving files would make us a
+            # file/credential source). Emit scp's own error and exit.
+            self._refuse_scp_source()
+            return
+
         # Process the exec command with LLM
         self._process_exec_with_llm()
+
+    # ------------------------------------------------------------------
+    # SCP upload capture
+
+    def _begin_scp_sink(self) -> None:
+        dest = scp.scp_dest_path(self.execcmd)
+        self._scp_sink = scp.ScpSink(base_path=dest)
+        log.msg(
+            eventid="cowrie.session.scp_attempt",
+            url=f"scp://inbound/{dest}",
+            outfile=dest,
+            raw=self.execcmd,
+            sessionno=f"S{self.sessionno}",
+            format="scp upload to %(outfile)s",
+        )
+        if self.terminal is not None:
+            self.terminal.write(self._scp_sink.initial())
+
+    def keystrokeReceived(self, keyID, modifier):
+        if self._scp_sink is not None:
+            self.input_data += keyID
+            out = self._scp_sink.feed(keyID)
+            if out and self.terminal is not None:
+                self.terminal.write(out)
+            return
+        self.input_data += keyID
+
+    def _refuse_scp_source(self) -> None:
+        if self.terminal is not None:
+            # scp reads a leading \x01 as a fatal error followed by text.
+            self.terminal.write(b"\x01scp: Permission denied\n")
+        ret = failure.Failure(error.ProcessTerminated(exitCode=1))
+        self.terminal.transport.processEnded(ret)
+
+    def _finalize_scp(self) -> None:
+        """Persist captured uploads to Artifacts + log, then end the exec."""
+        if self._scp_finalized:
+            return
+        self._scp_finalized = True
+        sink = self._scp_sink
+        if sink is not None:
+            for f in sink.files:
+                self._persist_scp_file(sink, f)
+        if self.terminal is not None:
+            try:
+                ret = failure.Failure(error.ProcessTerminated(exitCode=0))
+                self.terminal.transport.processEnded(ret)
+            except Exception:
+                pass
+
+    def _persist_scp_file(self, sink, f) -> None:
+        from cowrie.core.artifact import Artifact
+
+        dest = sink.dest_path(f)
+        try:
+            artifact = Artifact("scp-upload")
+            artifact.write(f.data)
+            closed = artifact.close()
+            sha = closed[0] if closed else None
+            saved = closed[1] if closed else None
+        except Exception as e:
+            log.err(f"scp artifact persist failed: {e}")
+            sha = saved = None
+        log.msg(
+            eventid="cowrie.session.file_download",
+            url=f"scp://inbound/{dest}",
+            outfile=saved,
+            shasum=sha,
+            destfile=dest,
+            sessionno=f"S{self.sessionno}",
+            format="Uploaded via scp to %(destfile)s (SHA-256 %(shasum)s -> %(outfile)s)",
+        )
 
     def _process_exec_with_llm(self) -> None:
         """
@@ -814,8 +901,13 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         ret = failure.Failure(error.ProcessTerminated(exitCode=0))
         self.terminal.transport.processEnded(ret)
 
-    def keystrokeReceived(self, keyID, modifier):
-        self.input_data += keyID
+    def eofReceived(self) -> None:
+        # For an scp upload, EOF means the sender finished — persist the
+        # captured payload(s) and exit cleanly instead of the base behavior.
+        if getattr(self, "_scp_sink", None) is not None:
+            self._finalize_scp()
+            return
+        HoneyPotBaseProtocol.eofReceived(self)
 
 
 class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLine):

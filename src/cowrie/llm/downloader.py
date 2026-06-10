@@ -6,9 +6,10 @@
 # ABOUTME: Cowrie's SSRF gate (real HTTP via treq, real TFTP via the RFC1350
 # ABOUTME: client, real FTP via Twisted's FTPClient), (c) persist via
 # ABOUTME: cowrie.core.artifact.Artifact, and (d) hand the LLM a
-# ABOUTME: [SHELL_OBSERVED] block so its narration matches reality. scp is
-# ABOUTME: intent-only (refused-by-default) — capturing the inbound binary
-# ABOUTME: SCP stream needs an SSH-channel hook below this protocol layer.
+# ABOUTME: [SHELL_OBSERVED] block so its narration matches reality. `scp`
+# ABOUTME: typed at the shell is narrated as permission-denied here; the
+# ABOUTME: real upload vector (`scp -t`, on a raw exec channel) is captured
+# ABOUTME: by cowrie.llm.scp.ScpSink, same file_download event shape.
 
 from __future__ import annotations
 

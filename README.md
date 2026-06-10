@@ -287,16 +287,16 @@ coverage report --include='*/cowrie/llm/*'
 
 ## Known limitations
 
-- **scp payload capture is intent-only.** The downloader detects scp
-  commands, parses src/dst + direction (inbound vs outbound), and
-  logs `cowrie.session.scp_attempt` with the parsed fields — useful
-  for threat intel on who's trying to stage payloads. The actual SCP
-  binary protocol receiver isn't implemented in v1 because it lives
-  below the LLM protocol layer (per-channel SSH dispatch) and requires
-  a deeper refactor. Outbound scp stays refused-by-default to avoid
-  becoming an unintentional credential tester. The LLM narrates the
-  attempt as "Permission denied (publickey,password)." — consistent
-  with how a real locked-down sshd would respond.
+- **scp upload capture (inbound).** `scp payload host:/path` runs
+  `scp -t /path` on a raw exec channel below the command layer;
+  `cowrie/llm/scp.py`'s `ScpSink` speaks that wire protocol — acking each
+  control/data step and capturing the real bytes into an `Artifact` with
+  the same `cowrie.session.file_download` event shape as the wget/curl
+  path (SHA-256, dest path, size cap). Outbound scp (`scp -f`, download
+  *from* us) stays refused-by-default to avoid becoming a file/credential
+  source. Residual: only the SCP exec-channel form is captured; a `scp`
+  *typed at the interactive shell* is still narrated as permission-denied
+  by the LLM (that path never carries the binary stream).
 - **Full-screen interactive programs defer to the LLM.** Bounded/batch
   forms are rendered deterministically and correctly — `top -bn1`,
   `ping -c N`, `vmstat` — because those exit on their own. But truly
