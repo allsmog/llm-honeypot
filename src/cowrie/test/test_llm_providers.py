@@ -253,7 +253,7 @@ class TestCodexOAuthBody(unittest.TestCase):
         path = tmp_path_token or tempfile.mkstemp(suffix=".json")[1]
         with open(path, "w") as f:
             json.dump({"tokens": {"access_token": "fake-codex-token"}}, f)
-        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.addCleanup(lambda: os.unlink(path) if os.path.exists(path) else None)
         cfg = _config({"codex_oauth_token_file": path})
         provider = CodexOAuthProvider(cfg)
         # SSE body — one delta plus completed event.
@@ -261,7 +261,7 @@ class TestCodexOAuthBody(unittest.TestCase):
             b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
             b'data: {"type":"response.completed","response":{"output_text":"hi"}}\n\n'
         )
-        provider.agent = StubAgent(body=sse_body)
+        provider.agent = StubAgent(body=sse_body)  # type: ignore[assignment]
         return provider
 
     def test_uses_responses_api_shape(self):
@@ -307,7 +307,7 @@ class TestAnthropicOAuthHeaderConfig(unittest.TestCase):
             json.dump(
                 {"claudeAiOauth": {"accessToken": "tok-1", "expiresAt": 0}}, f,
             )
-        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.addCleanup(lambda: os.unlink(path) if os.path.exists(path) else None)
 
         cfg = _config({"anthropic_oauth_token_file": path, **extra_config})
         return AnthropicOAuthProvider(cfg), path
@@ -361,7 +361,7 @@ class TestAuthReload(unittest.TestCase):
         # Write initial token.
         with open(path, "w") as f:
             json.dump({"claudeAiOauth": {"accessToken": "tok-old", "expiresAt": 0}}, f)
-        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.addCleanup(lambda: os.unlink(path) if os.path.exists(path) else None)
 
         cfg = _config({"anthropic_oauth_token_file": path})
         provider = AnthropicOAuthProvider(cfg)
@@ -406,7 +406,7 @@ class TestAuthReload(unittest.TestCase):
         os.close(fd)
         with open(path, "w") as f:
             json.dump({"claudeAiOauth": {"accessToken": "tok-x", "expiresAt": 0}}, f)
-        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.addCleanup(lambda: os.unlink(path) if os.path.exists(path) else None)
 
         cfg = _config({"anthropic_oauth_token_file": path})
         provider = AnthropicOAuthProvider(cfg)

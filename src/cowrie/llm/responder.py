@@ -115,24 +115,22 @@ def _respond(command: str, ctx: ShellContext) -> ResponderResult | None:
     # Peel leading `sudo [-n] [-u USER] [-S] ...` — the wrapped command runs
     # as root (or the -u target). We model that by overriding the effective
     # user for this single render.
-    user_override: str | None = None
-    argv, user_override = _peel_sudo(argv)
-    if argv is None:
+    inner, user_override = _peel_sudo(argv)
+    if inner is None:
         # `sudo` with no command — let the LLM produce the usage text.
         return None
 
-    cmd = argv[0]
-    args = argv[1:]
+    cmd = inner[0]
+    args = inner[1:]
     user = user_override or ctx.user
 
     handler = _DISPATCH.get(cmd)
     if handler is None:
         # Interactive/full-screen programs we deliberately don't fake in
-        # line mode — flag them so the caller can hint the LLM, but defer.
-        if cmd in _INTERACTIVE:
-            return ResponderResult(note=f"interactive:{cmd}") if False else None
+        # line mode — defer to the LLM.
         return None
-    return handler(args, ctx, user)
+    result: ResponderResult | None = handler(args, ctx, user)
+    return result
 
 
 def _peel_sudo(argv: list[str]) -> tuple[list[str] | None, str | None]:
@@ -934,7 +932,7 @@ def _base_env(ctx, user) -> dict[str, str]:
     }
 
 
-def _expand_var(name: str, ctx, user) -> str | None:
+def _expand_var(name: str, ctx: ShellContext, user: str) -> str | None:
     env = _base_env(ctx, user)
     if name in ctx.world.env_vars:
         return ctx.world.env_vars[name]
@@ -1304,7 +1302,7 @@ def _h_crontab(args, ctx, user):
     return None  # -e (edit) is interactive; -r (remove) is an action — defer
 
 
-def _resolve_path(arg: str, ctx) -> str:
+def _resolve_path(arg: str, ctx: ShellContext) -> str:
     """Resolve a possibly-relative path against the session cwd."""
     if not arg or arg == ".":
         return ctx.cwd

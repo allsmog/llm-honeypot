@@ -162,7 +162,7 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
     """Run every cross-command / against-persona invariant. All must pass."""
     results: list[CheckResult] = []
 
-    def check(name: str, passed: bool, detail: str = "") -> None:
+    def check(name: str, passed: object, detail: str = "") -> None:
         results.append(CheckResult(name=name, passed=bool(passed), detail=detail))
 
     p = ctx.persona

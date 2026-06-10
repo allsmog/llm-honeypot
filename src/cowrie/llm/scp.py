@@ -141,9 +141,9 @@ class ScpSink:
                 self._cur = None
             out += _ACK
             return
-        if _D_RE.match(line):
-            self._dir_stack.append(_D_RE.match(line).group(3).decode(
-                "utf-8", errors="replace"))
+        dm = _D_RE.match(line)
+        if dm:
+            self._dir_stack.append(dm.group(3).decode("utf-8", errors="replace"))
             out += _ACK
             return
         if line[:1] == b"E":

@@ -271,7 +271,8 @@ class TestAttackMapping(unittest.TestCase):
         # narrower and less fragile than a global twisted log observer.
         from cowrie.llm import protocol as protomod
         self._events: list[dict] = []
-        self.patch(protomod.log, "msg", lambda *a, **k: self._events.append(k))
+        self.patch(protomod.log, "msg",  # type: ignore[attr-defined]
+                   lambda *a, **k: self._events.append(k))
 
     def tearDown(self) -> None:
         try:

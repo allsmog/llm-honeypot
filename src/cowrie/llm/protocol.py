@@ -257,7 +257,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             return int(ws[0]) or 24, int(ws[1]) or 80
         return 24, 80
 
-    def _program_file_content(self, path, ctx) -> str | None:
+    def _program_file_content(self, path: str, ctx: respondermod.ShellContext) -> str | None:
         """Text for an editor/pager to display, or None (new/unknown file).
 
         Prefers the real bytes the session captured (WorldState content),
@@ -373,10 +373,11 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
     def _effective_user(self) -> str:
         """Top of the su/sudo stack, or the login user."""
+        login_user = str(self.user.username)
         world = getattr(self, "world", None)
         if world is not None:
-            return world.effective_user(self.user.username)
-        return self.user.username
+            return str(world.effective_user(login_user))
+        return login_user
 
     def _apply_input_mutations(self, command: str) -> None:
         for m in cmd_parser.parse_input_mutations(command):
@@ -714,8 +715,9 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             d = self.llm_client.generate(request)
         # Closure carries the request so _handle_llm_response can attach
         # the per-turn usage to the cowrie.llm.response event.
-        d.addCallback(lambda r, req=request, streamed=stream_enabled:
-                      self._handle_llm_response(r, req, streamed=streamed))
+        d.addCallback(  # type: ignore[call-overload]
+            lambda r, req=request, streamed=stream_enabled:
+            self._handle_llm_response(r, req, streamed=streamed))
         d.addErrback(self._handle_llm_error)
 
     def _on_stream_chunk(self, text: str) -> None:
@@ -733,7 +735,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         self.terminal.write(text.encode("utf-8"))
 
     def _handle_llm_response(
-        self, response: str, request: LLMRequest = None, *, streamed: bool = False,
+        self, response: str, request: LLMRequest | None = None, *, streamed: bool = False,
     ) -> None:
         """
         Handle the response from the LLM and display it to the user.
@@ -872,7 +874,7 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         HoneyPotBaseProtocol.connectionMade(self)
         self.setTimeout(60)
 
-        self._scp_sink = None
+        self._scp_sink: scp.ScpSink | None = None
         self._scp_finalized = False
         self._emit_attack_techniques(self.execcmd)
 

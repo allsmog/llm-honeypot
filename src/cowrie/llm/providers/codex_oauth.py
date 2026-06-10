@@ -171,10 +171,10 @@ class CodexOAuthProvider(LLMProvider):
                 continue
             for block in item.get("content", []):
                 if block.get("type") in ("output_text", "text"):
-                    return block.get("text", "")
+                    return str(block.get("text", ""))
         # Some Responses API responses include a convenience top-level field.
         if isinstance(payload.get("output_text"), str):
-            return payload["output_text"]
+            return str(payload["output_text"])
         return ""
 
     @classmethod
