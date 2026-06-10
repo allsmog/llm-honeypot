@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from configparser import ConfigParser
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class ProviderRegistry:
-    _registry: dict[str, type[LLMProvider]] = {}
+    _registry: ClassVar[dict[str, type[LLMProvider]]] = {}
 
     @classmethod
     def register(cls, name: str):

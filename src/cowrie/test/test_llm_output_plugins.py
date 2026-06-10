@@ -126,7 +126,7 @@ class TestPluginCompatibilityWithLLMEvents(unittest.TestCase):
         try:
             import pymisp  # noqa: F401
         except ImportError:
-            raise unittest.SkipTest("pymisp not installed (optional dep)")
+            raise unittest.SkipTest("pymisp not installed (optional dep)") from None
         plugin = _PluginHarness.make_misp()
         for eventid in NEW_LLM_EVENT_IDS:
             event = _llm_event(eventid)
@@ -139,7 +139,7 @@ class TestPluginCompatibilityWithLLMEvents(unittest.TestCase):
         try:
             import slack  # noqa: F401
         except ImportError:
-            raise unittest.SkipTest("slack SDK not installed (optional dep)")
+            raise unittest.SkipTest("slack SDK not installed (optional dep)") from None
         plugin = _PluginHarness.make_slack()
         for eventid in NEW_LLM_EVENT_IDS:
             event = _llm_event(eventid)

@@ -25,7 +25,6 @@ from cowrie.llm.providers.base import LLMMessage, LLMRequest
 from cowrie.llm.providers.codex_apikey import CodexAPIKeyProvider
 from cowrie.llm.providers.codex_oauth import CodexOAuthProvider
 
-
 # ----------------------------------------------------------------------
 # Stub HTTP plumbing
 

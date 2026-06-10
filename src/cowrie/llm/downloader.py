@@ -17,8 +17,8 @@ import re
 import shlex
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import treq
 from twisted.internet import defer
@@ -29,7 +29,6 @@ from cowrie.core.artifact import Artifact
 from cowrie.core.config import CowrieConfig
 from cowrie.core.network import communication_allowed
 
-
 # ----------------------------------------------------------------------
 # Intent parsing
 
@@ -38,7 +37,7 @@ from cowrie.core.network import communication_allowed
 class DownloadIntent:
     tool: str            # "wget" | "curl" | "tftp" | "ftpget"
     url: str             # full URL ("http://...", "ftp://...", "tftp://...")
-    outfile: Optional[str]  # destination as the attacker requested, or None
+    outfile: str | None  # destination as the attacker requested, or None
     raw_command: str
 
 
@@ -63,7 +62,7 @@ def _split_pipeline(line: str) -> str:
     return line
 
 
-def parse_download_command(line: str) -> Optional[DownloadIntent]:
+def parse_download_command(line: str) -> DownloadIntent | None:
     """Detect a leading wget/curl/tftp/ftpget and extract the URL.
 
     Returns None for non-download commands (cheapest possible miss path,
@@ -102,7 +101,7 @@ def parse_download_command(line: str) -> Optional[DownloadIntent]:
     return None
 
 
-def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_scp(args: list[str], raw: str) -> DownloadIntent | None:
     """Detect `scp <src> <dst>`. Both directions caught.
 
     Direction is encoded in the URL string:
@@ -141,7 +140,7 @@ def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
     )
 
 
-def _parse_wget(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_wget(args: list[str], raw: str) -> DownloadIntent | None:
     # wget [-O outfile | -O- ] [opts...] URL [URL...]
     outfile = None
     urls: list[str] = []
@@ -171,7 +170,7 @@ def _parse_wget(args: list[str], raw: str) -> Optional[DownloadIntent]:
     return DownloadIntent(tool="wget", url=urls[0], outfile=outfile, raw_command=raw)
 
 
-def _parse_curl(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_curl(args: list[str], raw: str) -> DownloadIntent | None:
     # curl [-o outfile | -O] [opts...] URL
     outfile = None
     use_remote_name = False
@@ -207,7 +206,7 @@ def _parse_curl(args: list[str], raw: str) -> Optional[DownloadIntent]:
 _TFTP_GET_RE = re.compile(r"(?:^|\s)(?:-g\s+)?(?:-r\s+(\S+))(?:\s+-l\s+(\S+))?")
 
 
-def _parse_tftp(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_tftp(args: list[str], raw: str) -> DownloadIntent | None:
     # busybox tftp -g -r remote_file [-l local_file] host [port]
     remote = None
     local = None
@@ -236,7 +235,7 @@ def _parse_tftp(args: list[str], raw: str) -> Optional[DownloadIntent]:
     )
 
 
-def _parse_ftpget(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_ftpget(args: list[str], raw: str) -> DownloadIntent | None:
     # busybox ftpget [-u user] [-p pass] host local remote
     user = None  # noqa: F841 — captured into URL below
     host = None
@@ -281,13 +280,13 @@ class FetchResult:
     outcome: str   # success | partial | failed_blocked | failed_dns
                    # | failed_connection | failed_http | tool_unsupported
     url: str
-    saved_to: Optional[str] = None
+    saved_to: str | None = None
     bytes_downloaded: int = 0
-    bytes_advertised: Optional[int] = None
-    sha256: Optional[str] = None
-    http_status: Optional[int] = None
-    content_type: Optional[str] = None
-    error_message: Optional[str] = None
+    bytes_advertised: int | None = None
+    sha256: str | None = None
+    http_status: int | None = None
+    content_type: str | None = None
+    error_message: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -476,7 +475,7 @@ def _do_treq_fetch(intent, log_event, url, size_cap, t0):
             ctype = ctype_h[0].decode("latin1", errors="replace")
         except Exception:
             pass
-        adv: Optional[int] = None
+        adv: int | None = None
         try:
             cl_h = resp.headers.getRawHeaders(b"content-length") or []
             if cl_h:
@@ -612,6 +611,7 @@ def _fetch_tftp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     """
     # Lazy-import to avoid pulling in HoneyPotCommand at module init.
     from twisted.internet import reactor
+
     from cowrie.commands.tftp import TFTPClient
 
     url = intent.url

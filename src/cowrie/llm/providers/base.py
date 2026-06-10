@@ -29,6 +29,7 @@ from twisted.web.iweb import IBodyProducer, IResponse
 from zope.interface import implementer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from configparser import ConfigParser
 
 
@@ -235,7 +236,7 @@ class LLMProvider(ABC):
         return False
 
     def generate_streaming(
-        self, request: LLMRequest, on_chunk: "Callable[[str], None]",
+        self, request: LLMRequest, on_chunk: Callable[[str], None],
     ) -> Deferred:
         """Stream the response, calling on_chunk(text) for each delta.
 
