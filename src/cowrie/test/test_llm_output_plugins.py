@@ -17,10 +17,9 @@ is a separate manual step.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from twisted.trial import unittest
-
 
 NEW_LLM_EVENT_IDS = (
     "cowrie.llm.prompt",
@@ -194,6 +193,7 @@ class TestJSONLogIncludesLLMEvents(unittest.TestCase):
 
     def test_llm_events_serialize_to_json(self):
         import json
+
         from cowrie.output.jsonlog import Output  # noqa: F401
         # Mirror the write() logic — strip the twisted-internal keys
         # then json.dump.
