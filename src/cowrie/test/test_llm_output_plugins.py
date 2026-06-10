@@ -30,6 +30,7 @@ NEW_LLM_EVENT_IDS = (
     "cowrie.llm.observation_leak",
     "cowrie.llm.deterministic",
     "cowrie.llm.attack",
+    "cowrie.llm.editor_save",
 )
 
 
@@ -66,6 +67,8 @@ def _llm_event(eventid: str, session: str = "abc123abc123") -> dict:
             "technique_names": ["Ingress Tool Transfer", "Unix Shell"],
             "tactics": ["command-and-control", "execution"],
         })
+    elif eventid == "cowrie.llm.editor_save":
+        base.update({"input": "/tmp/payload.sh", "size": 42})
     return base
 
 

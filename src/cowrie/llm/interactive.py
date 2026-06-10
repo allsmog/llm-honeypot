@@ -95,55 +95,60 @@ class TopProgram(InteractiveProgram):
 
 @dataclass
 class ViProgram(InteractiveProgram):
-    """A believable vi/vim screen with a working `:q` / `:q!` / `:wq` / `ZZ`
-    exit path. We don't implement editing — the goal is that opening an
-    editor doesn't instantly betray the honeypot and that the attacker can
-    get back out the way they expect."""
+    """A believable vi/vim with real (bounded) editing.
+
+    Supports normal/insert/command modes, cursor movement (h/j/k/l, 0/$),
+    insertion (i/a/A/I/o/O), single-char delete (x), and the exits attackers
+    reflex for (:q / :q! / :w / :wq / :x / ZZ). On save we invoke ``on_save``
+    so the edit persists into the session's WorldState — a later `cat`/`ls`
+    of the file then reflects what the attacker actually wrote.
+    """
 
     filename: str = ""
     content: str = ""
     rows: int = 24
     cols: int = 80
-    _mode: str = "normal"          # normal | command
+    on_save: Callable[[str, str], None] | None = None
+    _new_file: bool = False
+    _mode: str = "normal"          # normal | insert | command
     _cmdline: str = ""
     _z_pending: bool = False
-    _new_file: bool = field(default=False)
+    _lines: list[str] = field(default_factory=list)
+    _cy: int = 0                   # cursor row (line index)
+    _cx: int = 0                   # cursor column
+    _dirty: bool = False
+    _status_msg: str = ""          # transient ex-line message (E492, written)
+
+    def __post_init__(self) -> None:
+        self._lines = self.content.split("\n") if self.content else [""]
+
+    def current_content(self) -> str:
+        return "\n".join(self._lines)
 
     def render_initial(self) -> bytes:
         return _CLEAR + self._screen()
 
     def handle_key(self, data: bytes) -> KeyResult:
-        out = bytearray()
+        self._status_msg = ""  # a fresh keystroke clears the last ex message
         for byte in data:
             res = self._key(bytes([byte]))
-            out += res.output
             if res.done:
-                return KeyResult(output=bytes(out), done=True)
-        return KeyResult(output=bytes(out), done=False)
+                return res
+        # After processing a chunk, repaint the whole screen (simplest way
+        # to keep cursor + buffer + status coherent in line mode).
+        return KeyResult(output=self._screen(), done=False)
 
     def _key(self, b: bytes) -> KeyResult:
         if self._mode == "command":
-            if b in (b"\r", b"\n"):
-                cmd = self._cmdline.strip()
-                self._cmdline = ""
-                self._mode = "normal"
-                if cmd in ("q", "q!", "wq", "x", "wq!", "x!") or cmd.startswith("wq"):
-                    return KeyResult(output=_RESET + _CLEAR + _HOME, done=True)
-                # Unknown ex command — flash an error on the status line.
-                return KeyResult(output=self._status(f"E492: Not an editor command: {cmd}"))
-            if b in (b"\x7f", b"\x08"):  # backspace
-                self._cmdline = self._cmdline[:-1]
-                if not self._cmdline:
-                    self._mode = "normal"
-                return KeyResult(output=self._status(":" + self._cmdline))
-            if b == b"\x1b":  # ESC cancels the command line
-                self._cmdline = ""
-                self._mode = "normal"
-                return KeyResult(output=self._status_only())
-            self._cmdline += b.decode("latin1", errors="replace")
-            return KeyResult(output=self._status(":" + self._cmdline))
+            return self._key_command(b)
+        if self._mode == "insert":
+            return self._key_insert(b)
+        return self._key_normal(b)
 
-        # normal mode
+    # -- normal mode -------------------------------------------------------
+
+    def _key_normal(self, b: bytes) -> KeyResult:
+        line = self._lines[self._cy]
         if b == b":":
             self._mode = "command"
             self._cmdline = ""
@@ -151,33 +156,175 @@ class ViProgram(InteractiveProgram):
             return KeyResult(output=self._status(":"))
         if b == b"Z":
             if self._z_pending:  # ZZ = save & quit
+                self._save()
                 return KeyResult(output=_RESET + _CLEAR + _HOME, done=True)
             self._z_pending = True
-            return KeyResult(output=b"")
+            return KeyResult()
         self._z_pending = False
-        if b == b"\x03":  # Ctrl-C in vim just beeps / shows a hint
+        if b in (b"i",):
+            self._mode = "insert"
+        elif b == b"a":
+            self._cx = min(self._cx + 1, len(line))
+            self._mode = "insert"
+        elif b == b"A":
+            self._cx = len(line)
+            self._mode = "insert"
+        elif b == b"I":
+            self._cx = 0
+            self._mode = "insert"
+        elif b == b"o":
+            self._lines.insert(self._cy + 1, "")
+            self._cy += 1
+            self._cx = 0
+            self._mode = "insert"
+            self._dirty = True
+        elif b == b"O":
+            self._lines.insert(self._cy, "")
+            self._cx = 0
+            self._mode = "insert"
+            self._dirty = True
+        elif b in (b"h", b"\x7f"):
+            self._cx = max(0, self._cx - 1)
+        elif b == b"l":
+            self._cx = min(len(line), self._cx + 1)
+        elif b == b"j":
+            self._cy = min(len(self._lines) - 1, self._cy + 1)
+            self._cx = min(self._cx, len(self._lines[self._cy]))
+        elif b == b"k":
+            self._cy = max(0, self._cy - 1)
+            self._cx = min(self._cx, len(self._lines[self._cy]))
+        elif b == b"0":
+            self._cx = 0
+        elif b == b"$":
+            self._cx = max(0, len(line) - 1)
+        elif b == b"x" and line:
+            self._lines[self._cy] = line[: self._cx] + line[self._cx + 1 :]
+            self._cx = min(self._cx, max(0, len(self._lines[self._cy]) - 1))
+            self._dirty = True
+        elif b == b"\x03":  # Ctrl-C — vim hint beep
             return KeyResult(output=b"\x07")
-        return KeyResult(output=b"")
+        return KeyResult()
+
+    # -- insert mode -------------------------------------------------------
+
+    def _key_insert(self, b: bytes) -> KeyResult:
+        if b == b"\x1b":  # ESC -> normal
+            self._mode = "normal"
+            self._cx = max(0, self._cx - 1)
+            return KeyResult()
+        line = self._lines[self._cy]
+        if b in (b"\r", b"\n"):
+            before, after = line[: self._cx], line[self._cx :]
+            self._lines[self._cy] = before
+            self._lines.insert(self._cy + 1, after)
+            self._cy += 1
+            self._cx = 0
+            self._dirty = True
+            return KeyResult()
+        if b in (b"\x7f", b"\x08"):  # backspace
+            if self._cx > 0:
+                self._lines[self._cy] = line[: self._cx - 1] + line[self._cx :]
+                self._cx -= 1
+            elif self._cy > 0:  # join with previous line
+                prev = self._lines[self._cy - 1]
+                self._cx = len(prev)
+                self._lines[self._cy - 1] = prev + line
+                del self._lines[self._cy]
+                self._cy -= 1
+            self._dirty = True
+            return KeyResult()
+        # Printable character.
+        try:
+            ch = b.decode("utf-8")
+        except UnicodeDecodeError:
+            return KeyResult()
+        if ch.isprintable() or ch == "\t":
+            self._lines[self._cy] = line[: self._cx] + ch + line[self._cx :]
+            self._cx += 1
+            self._dirty = True
+        return KeyResult()
+
+    # -- command (ex) mode -------------------------------------------------
+
+    def _key_command(self, b: bytes) -> KeyResult:
+        if b in (b"\r", b"\n"):
+            cmd = self._cmdline.strip()
+            self._cmdline = ""
+            self._mode = "normal"
+            return self._run_ex(cmd)
+        if b in (b"\x7f", b"\x08"):
+            self._cmdline = self._cmdline[:-1]
+            if not self._cmdline:
+                self._mode = "normal"
+                return KeyResult(output=self._status_only())
+            return KeyResult(output=self._status(":" + self._cmdline))
+        if b == b"\x1b":
+            self._cmdline = ""
+            self._mode = "normal"
+            return KeyResult(output=self._status_only())
+        self._cmdline += b.decode("latin1", errors="replace")
+        return KeyResult(output=self._status(":" + self._cmdline))
+
+    def _run_ex(self, cmd: str) -> KeyResult:
+        # Strip a leading range/file arg we don't model (e.g. `w foo`).
+        base = cmd.split(" ", 1)[0]
+        if base in ("w", "write"):
+            self._save()
+            self._status_msg = f'"{self.filename or "noname"}" {len(self._lines)}L written'
+            return KeyResult()
+        if base in ("wq", "x", "wq!", "x!") or base.startswith("wq"):
+            self._save()
+            return KeyResult(output=_RESET + _CLEAR + _HOME, done=True)
+        if base in ("q!", "quit!"):
+            return KeyResult(output=_RESET + _CLEAR + _HOME, done=True)
+        if base in ("q", "quit"):
+            if self._dirty:
+                self._status_msg = "E37: No write since last change (add ! to override)"
+                return KeyResult()
+            return KeyResult(output=_RESET + _CLEAR + _HOME, done=True)
+        self._status_msg = f"E492: Not an editor command: {cmd}"
+        return KeyResult()
+
+    def _save(self) -> None:
+        self._dirty = False
+        self._new_file = False
+        if self.on_save is not None and self.filename:
+            try:
+                self.on_save(self.filename, self.current_content())
+            except Exception:
+                pass
+
+    # -- rendering ---------------------------------------------------------
 
     def _screen(self) -> bytes:
-        lines = self.content.split("\n") if self.content else []
         out = bytearray(_HOME)
         body_rows = self.rows - 1
         for i in range(body_rows):
             out += _CLEAR_LINE
-            if i < len(lines):
-                out += lines[i].encode("utf-8", errors="replace")
-            elif not lines and i == 0:
-                pass  # first line blank for an empty buffer
+            if i < len(self._lines):
+                out += self._lines[i].encode("utf-8", errors="replace")
+            elif i == 0 and not any(self._lines):
+                pass  # empty buffer: blank first line
             else:
-                out += b"~"  # vim's empty-line markers
+                out += b"~"
             out += b"\r\n"
-        out += self._status_bytes(self._default_status())
+        out += self._status_bytes(self._mode_status())
+        # Position the cursor (1-based rows/cols).
+        out += f"\x1b[{self._cy + 1};{self._cx + 1}H".encode()
         return bytes(out)
 
+    def _mode_status(self) -> str:
+        if self._mode == "command":
+            return ":" + self._cmdline
+        if self._status_msg:
+            return self._status_msg
+        if self._mode == "insert":
+            return "-- INSERT --"
+        return self._default_status()
+
     def _default_status(self) -> str:
-        n = self.content.count("\n") + 1 if self.content else 0
-        if self._new_file or not self.content:
+        n = len(self._lines)
+        if self._new_file:
             return f'"{self.filename}" [New]' if self.filename else "[No Name]"
         return f'"{self.filename}" {n}L'
 
@@ -258,6 +405,7 @@ def make_program(
     *,
     file_content: Callable[[str], str | None] | None = None,
     top_frame: Callable[[], str] | None = None,
+    on_save: Callable[[str, str], None] | None = None,
     rows: int = 24,
     cols: int = 80,
 ) -> InteractiveProgram | None:
@@ -265,7 +413,8 @@ def make_program(
 
     ``file_content(path)`` looks up a viewable file's text (from the VFS /
     WorldState) for editors/pagers; ``top_frame()`` yields the live top
-    frame. Both are injected so this module stays free of session state.
+    frame; ``on_save(path, content)`` persists an editor write back into the
+    session. All injected so this module stays free of session state.
     """
     parts = command.strip().split()
     if not parts:
@@ -294,7 +443,7 @@ def make_program(
             if got is not None:
                 content, is_new = got, False
         return ViProgram(filename=path, content=content, rows=rows, cols=cols,
-                         _new_file=is_new)
+                         on_save=on_save, _new_file=is_new)
 
     if prog in ("less", "more", "most", "pg"):
         if not targets or file_content is None:

@@ -303,11 +303,16 @@ coverage report --include='*/cowrie/llm/*'
   program paints a believable screen, `top` repaints on its refresh timer,
   pagers/editors show the real file content (from the VFS/WorldState), and
   each exits the way the attacker expects (`top`: q; `vi`: `:q`/`:q!`/
-  `:wq`/`ZZ`; `less`: q / space-at-end). Residuals: it's not a real editor
-  (no insert/edit, no search), `nano`/`emacs`/`watch` still defer to the
-  LLM, and `top`'s process list is a static frame that updates rather than
-  live-sampled. A skilled human probing editor internals can still tell;
-  automated tooling and casual operators generally can't. Toggle with
+  `:wq`/`ZZ`; `less`: q / space-at-end). **`vi` actually edits** — insert
+  mode (i/a/A/I/o/O), cursor movement (h/j/k/l/0/$), `x` delete, Enter/
+  Backspace — and a save (`:w`/`:wq`/`ZZ`) writes the buffer through to
+  WorldState, so a later `cat`/`ls`/`stat` of the file reflects exactly what
+  the attacker wrote (`vi /tmp/x` → type → `:wq` → `cat /tmp/x` returns it,
+  deterministically). Residuals: the editor models the common subset, not
+  all of vim (no `/` search, `dd`, visual mode); `nano`/`emacs`/`watch`
+  still defer to the LLM; `top`'s process list refreshes a frame rather than
+  live-sampling. A skilled human probing deep editor internals can still
+  tell; automated tooling and casual operators generally can't. Toggle with
   `[llm] interactive_programs`.
 - **Streaming responses are off by default.** Anthropic providers
   support it (`[llm] stream = true`); enabling it makes responses

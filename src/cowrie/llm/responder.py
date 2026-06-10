@@ -768,11 +768,16 @@ def _h_cat(args, ctx, user):
     if any(a.startswith("-") and a not in ("--",) for a in args):
         return None
     path = positional[0]
-    # If the session created/edited/appended this exact path (even a system
-    # file like /etc/passwd via `echo ... >> /etc/passwd`), the WorldState
-    # holds the ground truth — defer to the LLM, which sees that content in
-    # its prompt, rather than overriding it with the canonical render.
-    if path in ctx.world.files:
+    # If the session created/edited this exact path, the WorldState holds the
+    # ground truth. When we captured the real bytes (an editor save, a small
+    # download), echo them back deterministically so `cat` matches exactly;
+    # otherwise (e.g. an `echo >>` we only know the intent of) defer to the
+    # LLM, which has the content in its prompt.
+    fact = ctx.world.files.get(path)
+    if fact is not None:
+        if fact.content_snippet is not None:
+            body = fact.content_snippet
+            return ResponderResult(output=body if body.endswith("\n") else body + "\n")
         return None
     return _cat_one(path, ctx, user)
 

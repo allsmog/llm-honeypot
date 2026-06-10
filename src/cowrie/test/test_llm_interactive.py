@@ -105,6 +105,83 @@ class TestVi(unittest.TestCase):
         self.assertFalse(prog.handle_key(b"\r").done)
 
 
+class TestViEditing(unittest.TestCase):
+    def _save_sink(self):
+        saved = {}
+        return saved, (lambda p, c: saved.update({p: c}))
+
+    def test_insert_text_and_save(self):
+        saved, on_save = self._save_sink()
+        prog = I.ViProgram(filename="/tmp/x", content="", on_save=on_save,
+                           _new_file=True)
+        prog.render_initial()
+        for chunk in (b"i", b"hello", b"\x1b"):
+            prog.handle_key(chunk)
+        self.assertEqual(prog.current_content(), "hello")
+        prog.handle_key(b":wq\r")
+        self.assertEqual(saved, {"/tmp/x": "hello"})
+
+    def test_insert_mode_status_line(self):
+        prog = I.ViProgram(filename="f")
+        out = prog.handle_key(b"i")
+        self.assertIn(b"-- INSERT --", out.output)
+
+    def test_enter_splits_line(self):
+        prog = I.ViProgram(filename="f", content="")
+        for chunk in (b"i", b"a", b"\r", b"b", b"\x1b"):
+            prog.handle_key(chunk)
+        self.assertEqual(prog.current_content(), "a\nb")
+
+    def test_backspace_in_insert(self):
+        prog = I.ViProgram(filename="f", content="")
+        for chunk in (b"i", b"abc", b"\x7f"):
+            prog.handle_key(chunk)
+        self.assertEqual(prog.current_content(), "ab")
+
+    def test_o_opens_line_below(self):
+        prog = I.ViProgram(filename="f", content="first")
+        for chunk in (b"o", b"second", b"\x1b"):
+            prog.handle_key(chunk)
+        self.assertEqual(prog.current_content(), "first\nsecond")
+
+    def test_A_appends_at_end(self):
+        prog = I.ViProgram(filename="f", content="ab")
+        for chunk in (b"A", b"cd", b"\x1b"):
+            prog.handle_key(chunk)
+        self.assertEqual(prog.current_content(), "abcd")
+
+    def test_x_deletes_char(self):
+        prog = I.ViProgram(filename="f", content="Xab")
+        prog.handle_key(b"x")
+        self.assertEqual(prog.current_content(), "ab")
+
+    def test_w_saves_without_quitting(self):
+        saved, on_save = self._save_sink()
+        prog = I.ViProgram(filename="/etc/m", content="data", on_save=on_save)
+        prog.handle_key(b"x")              # edit (delete 'd')
+        res = prog.handle_key(b":w\r")
+        self.assertFalse(res.done)         # :w stays in the editor
+        self.assertEqual(saved["/etc/m"], "ata")
+        self.assertIn(b"written", res.output)
+
+    def test_q_on_dirty_buffer_warns(self):
+        prog = I.ViProgram(filename="f", content="x")
+        prog.handle_key(b"x")              # make it dirty
+        res = prog.handle_key(b":q\r")
+        self.assertFalse(res.done)         # blocked
+        self.assertIn(b"E37", res.output)
+
+    def test_q_bang_force_quits_dirty(self):
+        prog = I.ViProgram(filename="f", content="x")
+        prog.handle_key(b"x")
+        self.assertTrue(prog.handle_key(b":q!\r").done)
+
+    def test_save_without_filename_is_safe(self):
+        prog = I.ViProgram(filename="", content="x", on_save=None)
+        # No filename + no callback: :wq must still quit cleanly.
+        self.assertTrue(prog.handle_key(b":wq\r").done)
+
+
 class TestLess(unittest.TestCase):
     def _content(self, n=100):
         return "\n".join(f"line {i}" for i in range(n))

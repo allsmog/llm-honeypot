@@ -242,15 +242,22 @@ class TestEtcFiles(unittest.TestCase):
     def test_cat_unknown_file_defers(self):
         self.assertIsNone(R.respond("cat /home/user/secret.txt", _ctx()))
 
-    def test_cat_modified_system_file_defers_to_llm(self):
-        # If the attacker appended to /etc/passwd, the canonical render must
-        # NOT override it — defer so the LLM narrates the WorldState content.
+    def test_cat_modified_file_with_known_content_is_returned(self):
+        # When we captured the real bytes (an editor save), cat echoes them
+        # exactly — the canonical render must NOT override the modification.
         ctx = _ctx()
-        # Sanity: unmodified passwd is handled deterministically.
-        self.assertIsNotNone(R.respond("cat /etc/passwd", ctx))
+        self.assertIsNotNone(R.respond("cat /etc/passwd", ctx))  # unmodified
         ctx.world.add_file(path="/etc/passwd", source="edited",
                            content_snippet="root:x:0:0...\nbackdoor:x:0:0::/root:/bin/sh")
-        self.assertIsNone(R.respond("cat /etc/passwd", ctx))
+        out = R.respond("cat /etc/passwd", ctx).output
+        self.assertIn("backdoor:x:0:0", out)
+
+    def test_cat_intent_only_modified_file_defers(self):
+        # A modification we know the intent of but not the bytes (no
+        # content_snippet) defers to the LLM rather than guessing.
+        ctx = _ctx()
+        ctx.world.add_file(path="/etc/hosts", source="edited", content_snippet=None)
+        self.assertIsNone(R.respond("cat /etc/hosts", ctx))
 
 
 class TestProcesses(unittest.TestCase):

@@ -507,6 +507,28 @@ class TestInteractivePrograms(unittest.TestCase):
         self.assertIsNone(self.proto._program)
         self.assertEqual(len(self.stub.calls), 1)  # went to the LLM
 
+    def test_editor_save_persists_and_cat_reflects_it(self):
+        # Full write-through loop: edit a new file in vi, save, then cat it.
+        self.proto.user.username = "root"
+        self.proto.cwd = "/root"
+        self.proto.lineReceived(b"vi /tmp/payload.sh")
+        self.assertIsNotNone(self.proto._program)
+        for chunk in (b"i", b"echo pwned", b"\x1b"):
+            self.proto.keystrokeReceived(chunk, None)
+        self.proto.keystrokeReceived(b":wq\r", None)
+        self.assertIsNone(self.proto._program)  # back to shell
+        # WorldState captured the edit.
+        self.assertIn("/tmp/payload.sh", self.proto.world.files)
+        self.assertEqual(
+            self.proto.world.files["/tmp/payload.sh"].content_snippet,
+            "echo pwned",
+        )
+        # And cat returns exactly what was written — deterministically.
+        self.tr.clear()
+        self.proto.lineReceived(b"cat /tmp/payload.sh")
+        self.assertIn(b"echo pwned", self.tr.value())
+        self.assertEqual(len(self.stub.calls), 0)  # no LLM needed
+
 
 class TestSuFlow(unittest.TestCase):
     """su/sudo changes the effective user, the prompt sigil, and exit pops."""

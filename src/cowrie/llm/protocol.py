@@ -234,6 +234,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 command,
                 file_content=lambda p: self._program_file_content(p, ctx),
                 top_frame=top_frame,
+                on_save=lambda p, body: self._persist_editor_save(p, body, ctx),
                 rows=rows,
                 cols=cols,
             )
@@ -256,6 +257,26 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         if isinstance(ws, (tuple, list)) and len(ws) >= 2:
             return int(ws[0]) or 24, int(ws[1]) or 80
         return 24, 80
+
+    def _persist_editor_save(
+        self, path: str, body: str, ctx: respondermod.ShellContext
+    ) -> None:
+        """Persist an editor (vi/vim) save into WorldState so a later
+        cat/ls/stat of the file reflects exactly what the attacker wrote."""
+        resolved = respondermod._resolve_path(path, ctx)
+        ctx.world.add_file(
+            path=resolved,
+            size_bytes=len(body.encode("utf-8", errors="replace")),
+            source="edited",
+            content_snippet=body,
+        )
+        log.msg(
+            eventid="cowrie.llm.editor_save",
+            input=resolved,
+            size=len(body),
+            sessionno=f"S{self.sessionno}",
+            format="editor save: %(input)s (%(size)d bytes)",
+        )
 
     def _program_file_content(self, path: str, ctx: respondermod.ShellContext) -> str | None:
         """Text for an editor/pager to display, or None (new/unknown file).
