@@ -15,7 +15,9 @@ from twisted.internet.defer import Deferred
 from twisted.python import log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm.providers import ProviderRegistry  # noqa: F401  — triggers provider registration
+from cowrie.llm.providers import (
+    ProviderRegistry,
+)
 from cowrie.llm.providers.base import LLMMessage, LLMProvider, LLMRequest
 
 if TYPE_CHECKING:

@@ -16,12 +16,23 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import cmd_parser
-from cowrie.llm import downloader
-from cowrie.llm.llm import LLMClient
+from cowrie.llm import attack_map, cmd_parser, downloader, scp
+from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
+from cowrie.llm import prompts as promptmod
+from cowrie.llm import responder as respondermod
+from cowrie.llm.llm import LLMClient
 from cowrie.llm.providers.base import LLMMessage, LLMRequest
 from cowrie.llm.worldstate import WorldState
+
+
+class _DefaultingMap(dict):
+    """dict for str.format_map that returns "" for unknown keys instead of
+    raising KeyError — so an operator's custom system_prompt template can
+    reference a variable we don't supply without crashing the session."""
+
+    def __missing__(self, key):
+        return ""
 
 
 def strip_markdown(text: str) -> str:
@@ -60,6 +71,10 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # Fastpath commands (cd, pwd, exit, clear) don't count.
         self._command_count = 0
         self._budget_exhausted_logged = False
+        # Full-screen program mode (top/vi/less): when set, keystrokes are
+        # routed to the program instead of the line editor.
+        self._program = None
+        self._refresh_call = None
 
     def getProtoTransport(self):
         """
@@ -167,6 +182,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         string = line.decode("utf8")
 
         log.msg(eventid="cowrie.command.input", input=string, format="CMD: %(input)s")
+        self._emit_attack_techniques(string)
 
         if self._try_fastpath(string):
             return
@@ -176,9 +192,213 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # still narrates the command's terminal output; WorldState just
         # keeps the picture consistent across turns.
         self._apply_input_mutations(string)
+        # Deterministic responder: identity/info commands (whoami, uname,
+        # free, cat /etc/os-release, ps, ...) are rendered from the pinned
+        # persona + WorldState instead of the LLM. Instant (no model round
+        # trip → fixes the timing fingerprint), perfectly consistent across
+        # turns, and free. Unrecognized commands return None and fall
+        # through to the download interceptor / LLM unchanged.
+        if self._try_deterministic(string):
+            return
+        # Full-screen programs (top/htop, vi/vim, less/more) take over the
+        # terminal — render the alternate screen and route subsequent keys
+        # to the program until the attacker exits (q, :q, ...).
+        if self._try_interactive(string):
+            return
         if self._try_download_intercept(string):
             return
         self._process_command_with_llm(string)
+
+    def _try_interactive(self, command: str) -> bool:
+        """Enter full-screen program mode if ``command`` launches one.
+
+        Only meaningful for the interactive (PTY) protocol; the exec path
+        is one-shot and never calls lineReceived. Any failure bails to the
+        normal path rather than risk wedging the session.
+        """
+        if getattr(self, "terminal", None) is None:
+            return False
+        if not CowrieConfig.getboolean(
+            "llm", "interactive_programs", fallback=True
+        ):
+            return False
+        try:
+            ctx = self._shell_context()
+
+            def top_frame() -> str:
+                r = respondermod.respond("top -bn1", ctx)
+                return r.output if r is not None else "top - load average: 0.00\n"
+
+            rows, cols = self._terminal_size()
+            prog = interactivemod.make_program(
+                command,
+                file_content=lambda p: self._program_file_content(p, ctx),
+                top_frame=top_frame,
+                on_save=lambda p, body: self._persist_editor_save(p, body, ctx),
+                rows=rows,
+                cols=cols,
+            )
+        except Exception:
+            return False
+        if prog is None:
+            return False
+        self._program = prog
+        try:
+            if self.terminal is not None:
+                self.terminal.write(prog.render_initial())
+            self._schedule_program_refresh()
+        except Exception:
+            self._program = None
+            return False
+        return True
+
+    def _terminal_size(self) -> tuple[int, int]:
+        ws = getattr(getattr(self.user, "server", None), "windowSize", None)
+        if isinstance(ws, (tuple, list)) and len(ws) >= 2:
+            return int(ws[0]) or 24, int(ws[1]) or 80
+        return 24, 80
+
+    def _persist_editor_save(
+        self, path: str, body: str, ctx: respondermod.ShellContext
+    ) -> None:
+        """Persist an editor (vi/vim) save into WorldState so a later
+        cat/ls/stat of the file reflects exactly what the attacker wrote."""
+        resolved = respondermod._resolve_path(path, ctx)
+        ctx.world.add_file(
+            path=resolved,
+            size_bytes=len(body.encode("utf-8", errors="replace")),
+            source="edited",
+            content_snippet=body,
+        )
+        log.msg(
+            eventid="cowrie.llm.editor_save",
+            input=resolved,
+            size=len(body),
+            sessionno=f"S{self.sessionno}",
+            format="editor save: %(input)s (%(size)d bytes)",
+        )
+
+    def _program_file_content(self, path: str, ctx: respondermod.ShellContext) -> str | None:
+        """Text for an editor/pager to display, or None (new/unknown file).
+
+        Prefers the real bytes the session captured (WorldState content),
+        then a deterministic `cat` of a known file; otherwise None so the
+        editor opens an empty buffer / the pager declines.
+        """
+        resolved = respondermod._resolve_path(path, ctx)
+        fact = ctx.world.files.get(resolved)
+        if fact is not None and fact.content_snippet:
+            return fact.content_snippet
+        cat = respondermod.respond(f"cat {resolved}", ctx)
+        if cat is not None and cat.output and "No such file" not in cat.output:
+            return cat.output.rstrip("\n")
+        return None
+
+    def _schedule_program_refresh(self) -> None:
+        prog = getattr(self, "_program", None)
+        if prog is None or prog.refresh_interval <= 0:
+            return
+        from twisted.internet import reactor
+        self._refresh_call = reactor.callLater(
+            prog.refresh_interval, self._do_program_refresh
+        )
+
+    def _do_program_refresh(self) -> None:
+        self._refresh_call = None
+        prog = getattr(self, "_program", None)
+        if prog is None or self.terminal is None:
+            return
+        try:
+            self.terminal.write(prog.on_refresh())
+        except Exception:
+            self._exit_program()
+            return
+        self._schedule_program_refresh()
+
+    def _exit_program(self) -> None:
+        """Leave program mode and redraw the shell prompt."""
+        call = getattr(self, "_refresh_call", None)
+        if call is not None:
+            try:
+                call.cancel()
+            except Exception:
+                pass
+        self._refresh_call = None
+        self._program = None
+        self._show_prompt()
+
+    def _emit_attack_techniques(self, command: str) -> None:
+        """Tag the command with MITRE ATT&CK techniques for threat intel.
+
+        Emitted as ``cowrie.llm.attack`` alongside the command stream so a
+        SIEM can pivot on technique ids (T1105, T1496, ...) instead of
+        re-deriving them from raw command text. Best-effort: classification
+        never raises, and no event fires when nothing is evidenced.
+        """
+        if not CowrieConfig.getboolean("llm", "attack_mapping", fallback=True):
+            return
+        techniques = attack_map.classify(command)
+        if not techniques:
+            return
+        log.msg(
+            eventid="cowrie.llm.attack",
+            input=command,
+            techniques=[t.id for t in techniques],
+            technique_names=[t.name for t in techniques],
+            tactics=sorted({t.tactic for t in techniques}),
+            sessionno=f"S{self.sessionno}",
+            format="ATT&CK: %(input)s",
+        )
+
+    def _try_deterministic(self, command: str) -> bool:
+        """Render ``command`` from local state if we can. Returns True iff
+        handled (output written + prompt shown), False to fall through."""
+        if not CowrieConfig.getboolean(
+            "llm", "deterministic_responses", fallback=True
+        ):
+            return False
+        ctx = self._shell_context()
+        result = respondermod.respond(command, ctx)
+        if result is None:
+            return False
+        # Count toward neither the LLM budget nor the LLM history — these
+        # are pure local renders. They are derived from facts already in
+        # the persona/WorldState, so the LLM stays consistent with them.
+        log.msg(
+            eventid="cowrie.llm.deterministic",
+            input=command,
+            cwd=self.cwd,
+            sessionno=f"S{self.sessionno}",
+            format="deterministic: %(input)s",
+        )
+        if self.terminal is not None and result.output:
+            self.terminal.write(result.output.encode("utf-8"))
+        jitter_min = CowrieConfig.getint("llm", "fastpath_jitter_ms_min", fallback=5)
+        jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
+        self._show_prompt(jitter_min, jitter_max)
+        return True
+
+    def _shell_context(self) -> respondermod.ShellContext:
+        """Snapshot the session state the deterministic responder needs."""
+        return respondermod.ShellContext(
+            persona=self.persona,
+            boot_time=self.boot_time,
+            world=self.world,
+            cwd=self.cwd,
+            login_user=self.user.username,
+            hostname=self.hostname,
+            server_ip=getattr(self, "kippoIP", ""),
+            client_ip=getattr(self, "clientIP", ""),
+            seed=f"{getattr(self, 'realClientIP', '')}|{self.boot_time}",
+        )
+
+    def _effective_user(self) -> str:
+        """Top of the su/sudo stack, or the login user."""
+        login_user = str(self.user.username)
+        world = getattr(self, "world", None)
+        if world is not None:
+            return str(world.effective_user(login_user))
+        return login_user
 
     def _apply_input_mutations(self, command: str) -> None:
         for m in cmd_parser.parse_input_mutations(command):
@@ -226,6 +446,16 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             elif m.kind == "set_env":
                 if m.env_name:
                     self.world.add_env(m.env_name, m.env_value or "")
+            elif m.kind == "push_user":
+                if m.user:
+                    self.world.push_user(m.user)
+            elif m.kind == "pop_user":
+                self.world.pop_user()
+            elif m.kind == "add_process":
+                if m.proc_command:
+                    self.world.add_process(
+                        m.proc_command, user=self._effective_user()
+                    )
 
     def _try_download_intercept(self, command: str) -> bool:
         """If the command is a wget/curl/tftp/ftpget, fetch first then
@@ -294,6 +524,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         rest = parts[1] if len(parts) > 1 else ""
 
         if head in ("exit", "logout", "quit"):
+            # If we're inside a su / sudo subshell, `exit` returns to the
+            # parent shell rather than closing the connection — pop the
+            # effective-user stack and re-prompt as the prior user.
+            world = getattr(self, "world", None)
+            if world is not None and world.user_stack:
+                world.pop_user()
+                self._show_prompt(jitter_min, jitter_max)
+                return True
             if self.terminal is not None:
                 self.terminal.loseConnection()
             return True
@@ -351,36 +589,30 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         For exec commands a tighter default is used to suppress conversational output.
         """
         if exec_command:
-            default = (
-                "You are simulating a Linux server that has been accessed via SSH "
-                "with a command to execute. "
-                "Respond with ONLY the output that would be displayed after executing this command. "
-                "Keep responses realistic, including appropriate error messages for invalid commands."
-            )
+            default = promptmod.EXEC_SYSTEM_PROMPT
             config_key = "system_prompt_exec"
         else:
-            default = (
-                "You are simulating a Linux server that has been accessed via SSH. "
-                "Respond as if you were the shell on this system. "
-                "Your response should be the output that would be displayed after executing the command. "
-                "Keep responses realistic, including appropriate error messages for invalid commands. "
-                "For file paths, maintain consistent state with previous commands."
-            )
+            default = promptmod.INTERACTIVE_SYSTEM_PROMPT
             config_key = "system_prompt"
 
         template = CowrieConfig.get("llm", config_key, fallback=default)
+        # Effective user reflects su/sudo so the prompt's persona matches the
+        # WorldState's user stack across turns.
+        username = self._effective_user() if not exec_command else self.user.username
         context = template.format_map(
-            {
-                "hostname": self.hostname,
-                "username": self.user.username,
-                "ip": getattr(self, "kippoIP", ""),
-                "ip6": getattr(self, "kippoIPv6", ""),
-                "client_ip": getattr(self, "clientIP", ""),
-                "cwd": self.cwd,
-            }
+            _DefaultingMap(
+                {
+                    "hostname": self.hostname,
+                    "username": username,
+                    "ip": getattr(self, "kippoIP", ""),
+                    "ip6": getattr(self, "kippoIPv6", ""),
+                    "client_ip": getattr(self, "clientIP", ""),
+                    "cwd": self.cwd,
+                }
+            )
         )
         context += (
-            f" The hostname is '{self.hostname}' and username is '{self.user.username}'."
+            f" The hostname is '{self.hostname}' and username is '{username}'."
             f" The current working directory is '{self.cwd}'."
         )
         # Pin distro/kernel/uptime/cpu/memory so identity-probe commands
@@ -455,9 +687,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         mutable_tail = self.world.to_prompt_section() if hasattr(self, "world") else ""
 
         # Reconstruct conversation messages from command_history (assistant
-        # turns prefixed "System:", user turns "User:").
+        # turns prefixed "System:", user turns "User:"). The recency window
+        # is configurable: durable session facts (files, env, processes,
+        # user stack) live in WorldState's prompt tail — Anthropic's
+        # "structured notes outside the context window" pattern — so a
+        # modest window stays coherent without re-sending the whole session.
+        window = CowrieConfig.getint("llm", "history_window_turns", fallback=16)
         request_messages: list[LLMMessage] = []
-        for raw in self.command_history[-10:]:
+        for raw in self.command_history[-window:]:
             if raw.startswith("User:"):
                 request_messages.append(
                     LLMMessage(role="user", content=raw[len("User:") :].strip())
@@ -466,6 +703,11 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 request_messages.append(
                     LLMMessage(role="assistant", content=raw[len("System:") :].strip())
                 )
+        # The Messages API requires the first turn to be `user`. A window
+        # that slices mid-pair can leave a leading assistant turn — drop any
+        # leading assistant messages so the request is always valid.
+        while request_messages and request_messages[0].role == "assistant":
+            request_messages.pop(0)
 
         request = LLMRequest(
             system_blocks=[(stable_head, True), (mutable_tail, False)],
@@ -494,8 +736,9 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             d = self.llm_client.generate(request)
         # Closure carries the request so _handle_llm_response can attach
         # the per-turn usage to the cowrie.llm.response event.
-        d.addCallback(lambda r, req=request, streamed=stream_enabled:
-                      self._handle_llm_response(r, req, streamed=streamed))
+        d.addCallback(  # type: ignore[call-overload]
+            lambda r, req=request, streamed=stream_enabled:
+            self._handle_llm_response(r, req, streamed=streamed))
         d.addErrback(self._handle_llm_error)
 
     def _on_stream_chunk(self, text: str) -> None:
@@ -513,7 +756,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         self.terminal.write(text.encode("utf-8"))
 
     def _handle_llm_response(
-        self, response: str, request: LLMRequest = None, *, streamed: bool = False,
+        self, response: str, request: LLMRequest | None = None, *, streamed: bool = False,
     ) -> None:
         """
         Handle the response from the LLM and display it to the user.
@@ -592,21 +835,26 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         max_jitter = max(0, jitter_max_ms)
         min_jitter = max(0, min(jitter_min_ms, max_jitter))
         if max_jitter > 0:
-            from twisted.internet import reactor
             import random
+
+            from twisted.internet import reactor
             delay_ms = random.randint(min_jitter, max_jitter)
             reactor.callLater(delay_ms / 1000.0, self._write_prompt_safe)
             return
         self._write_prompt_safe()
 
     def _write_prompt_safe(self) -> None:
-        """Write the prompt unless the terminal is gone (post-disconnect)."""
+        """Write the prompt unless the terminal is gone (post-disconnect).
+
+        Uses the *effective* user (top of the su/sudo stack) so the prompt
+        and the `#`/`$` sigil change when an attacker `su`'s to root and
+        back — a detail real shells get right and many honeypots don't.
+        """
         if self.terminal is None:
             return
-        if self.user.username == "root":
-            prompt = f"{self.user.username}@{self.hostname}:{self.cwd}# "
-        else:
-            prompt = f"{self.user.username}@{self.hostname}:{self.cwd}$ "
+        user = self._effective_user()
+        sigil = "#" if user == "root" else "$"
+        prompt = f"{user}@{self.hostname}:{self.cwd}{sigil} "
         self.terminal.write(prompt.encode("utf-8"))
 
     def uptime(self):
@@ -647,8 +895,95 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         HoneyPotBaseProtocol.connectionMade(self)
         self.setTimeout(60)
 
+        self._scp_sink: scp.ScpSink | None = None
+        self._scp_finalized = False
+        self._emit_attack_techniques(self.execcmd)
+
+        # scp upload (`scp -t <path>`) rides a raw channel below the command
+        # layer — capture the real payload instead of refusing it.
+        if scp.is_scp_sink(self.execcmd):
+            self._begin_scp_sink()
+            return
+        if scp.is_scp_source(self.execcmd):
+            # Download FROM us: refuse (serving files would make us a
+            # file/credential source). Emit scp's own error and exit.
+            self._refuse_scp_source()
+            return
+
         # Process the exec command with LLM
         self._process_exec_with_llm()
+
+    # ------------------------------------------------------------------
+    # SCP upload capture
+
+    def _begin_scp_sink(self) -> None:
+        dest = scp.scp_dest_path(self.execcmd)
+        self._scp_sink = scp.ScpSink(base_path=dest)
+        log.msg(
+            eventid="cowrie.session.scp_attempt",
+            url=f"scp://inbound/{dest}",
+            outfile=dest,
+            raw=self.execcmd,
+            sessionno=f"S{self.sessionno}",
+            format="scp upload to %(outfile)s",
+        )
+        if self.terminal is not None:
+            self.terminal.write(self._scp_sink.initial())
+
+    def keystrokeReceived(self, keyID, modifier):
+        if self._scp_sink is not None:
+            self.input_data += keyID
+            out = self._scp_sink.feed(keyID)
+            if out and self.terminal is not None:
+                self.terminal.write(out)
+            return
+        self.input_data += keyID
+
+    def _refuse_scp_source(self) -> None:
+        if self.terminal is not None:
+            # scp reads a leading \x01 as a fatal error followed by text.
+            self.terminal.write(b"\x01scp: Permission denied\n")
+        ret = failure.Failure(error.ProcessTerminated(exitCode=1))
+        self.terminal.transport.processEnded(ret)
+
+    def _finalize_scp(self) -> None:
+        """Persist captured uploads to Artifacts + log, then end the exec."""
+        if self._scp_finalized:
+            return
+        self._scp_finalized = True
+        sink = self._scp_sink
+        if sink is not None:
+            for f in sink.files:
+                self._persist_scp_file(sink, f)
+        if self.terminal is not None:
+            try:
+                ret = failure.Failure(error.ProcessTerminated(exitCode=0))
+                self.terminal.transport.processEnded(ret)
+            except Exception:
+                pass
+
+    def _persist_scp_file(self, sink, f) -> None:
+        from cowrie.core.artifact import Artifact
+
+        dest = sink.dest_path(f)
+        try:
+            artifact = Artifact("scp-upload")
+            artifact.write(f.data)
+            closed = artifact.close()
+            sha = closed[0] if closed else None
+            saved = closed[1] if closed else None
+        except Exception as e:
+            log.err(f"scp artifact persist failed: {e}")
+            sha = saved = None
+        log.msg(
+            eventid="cowrie.session.file_download",
+            url=f"scp://inbound/{dest}",
+            outfile=saved,
+            shasum=sha,
+            destfile=dest,
+            sessionno=f"S{self.sessionno}",
+            format="Uploaded via scp to %(destfile)s (SHA-256 %(shasum)s -> %(outfile)s)",
+        )
 
     def _process_exec_with_llm(self) -> None:
         """
@@ -696,8 +1031,13 @@ class HoneyPotExecProtocol(HoneyPotBaseProtocol):
         ret = failure.Failure(error.ProcessTerminated(exitCode=0))
         self.terminal.transport.processEnded(ret)
 
-    def keystrokeReceived(self, keyID, modifier):
-        self.input_data += keyID
+    def eofReceived(self) -> None:
+        # For an scp upload, EOF means the sender finished — persist the
+        # captured payload(s) and exit cleanly instead of the base behavior.
+        if getattr(self, "_scp_sink", None) is not None:
+            self._finalize_scp()
+            return
+        HoneyPotBaseProtocol.eofReceived(self)
 
 
 class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLine):
@@ -748,6 +1088,15 @@ class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLin
         HoneyPotBaseProtocol.timeoutConnection(self)
 
     def connectionLost(self, reason):
+        # Cancel any pending full-screen refresh timer before teardown.
+        call = getattr(self, "_refresh_call", None)
+        if call is not None:
+            try:
+                call.cancel()
+            except Exception:
+                pass
+            self._refresh_call = None
+        self._program = None
         HoneyPotBaseProtocol.connectionLost(self, reason)
         recvline.HistoricRecvLine.connectionLost(self, reason)
         self.keyHandlers = {}
@@ -757,6 +1106,22 @@ class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLin
         Overriding super to prevent terminal.reset()
         """
         self.setInsertMode()
+
+    def keystrokeReceived(self, keyID, modifier):
+        # In full-screen program mode (top/vi/less), keystrokes drive the
+        # program, not the line editor. Any error exits cleanly to the shell
+        # rather than wedging the session.
+        if getattr(self, "_program", None) is not None:
+            try:
+                res = self._program.handle_key(keyID)
+                if self.terminal is not None and res.output:
+                    self.terminal.write(res.output)
+                if res.done:
+                    self._exit_program()
+            except Exception:
+                self._exit_program()
+            return
+        recvline.HistoricRecvLine.keystrokeReceived(self, keyID, modifier)
 
     def characterReceived(self, ch, moreCharactersComing):
         if self.terminal is None:

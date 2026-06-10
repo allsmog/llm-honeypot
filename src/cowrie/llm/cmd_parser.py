@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 MutationKind = Literal[
     "create_file",
@@ -21,17 +21,22 @@ MutationKind = Literal[
     "move_file",
     "copy_file",
     "set_env",
+    "push_user",
+    "pop_user",
+    "add_process",
 ]
 
 
 @dataclass
 class CmdMutation:
     kind: MutationKind
-    path: Optional[str] = None
-    dst_path: Optional[str] = None  # for cp/mv
-    content: Optional[str] = None   # for echo/touch
-    env_name: Optional[str] = None
-    env_value: Optional[str] = None
+    path: str | None = None
+    dst_path: str | None = None  # for cp/mv
+    content: str | None = None   # for echo/touch
+    env_name: str | None = None
+    env_value: str | None = None
+    user: str | None = None        # for push_user (su/sudo target)
+    proc_command: str | None = None  # for add_process (cmd &)
 
 
 # ----------------------------------------------------------------------
@@ -101,11 +106,23 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
     Tolerant of unparseable input: returns [] on shlex / regex
     failure rather than raising.
     """
+    # Background process: a single trailing `&` (not `&&`). Record the job
+    # so ps/jobs stay consistent; we don't also parse its file effects.
+    bg = _parse_background(line)
+    if bg is not None:
+        return [bg]
+
     head = _split_first_command(line).strip()
     if not head:
         return []
 
     mutations: list[CmdMutation] = []
+
+    # User switch: su / sudo -i / sudo su. Push the effective user so
+    # whoami/id and the prompt reflect it on subsequent turns.
+    switch = _parse_user_switch(head)
+    if switch is not None:
+        return [switch]
 
     # echo ... > path  (or >>)
     m = _ECHO_REDIRECT_RE.match(head)
@@ -183,3 +200,81 @@ def _tokens(args_str: str) -> list[str]:
         return shlex.split(args_str)
     except ValueError:
         return args_str.split()
+
+
+def _parse_background(line: str) -> CmdMutation | None:
+    """Detect `cmd &` (one trailing ampersand, not `&&`) and return an
+    add_process mutation. None when the line isn't backgrounded."""
+    stripped = line.rstrip()
+    if not stripped.endswith("&") or stripped.endswith("&&"):
+        return None
+    cmd = stripped[:-1].strip()
+    if not cmd:
+        return None
+    # Drop a leading `nohup` for the recorded command name; it's a wrapper.
+    if cmd.startswith("nohup "):
+        cmd = cmd[len("nohup "):].strip()
+    if not cmd:
+        return None
+    return CmdMutation(kind="add_process", proc_command=cmd)
+
+
+def _parse_user_switch(head: str) -> CmdMutation | None:
+    """Detect su / sudo-into-a-shell and return a push_user mutation.
+
+    Recognized: `su`, `su -`, `su [-|-l|--login] USER`, `sudo -i`, `sudo -s`,
+    `sudo su`, `sudo su -`, `sudo su - USER`, `sudo -u USER -i/-s`.
+    Returns None for anything else (including `sudo <normal-cmd>`, which is a
+    one-shot elevation, not a persistent shell).
+    """
+    try:
+        toks = shlex.split(head)
+    except ValueError:
+        return None
+    if not toks:
+        return None
+
+    if toks[0] == "su":
+        # Skip option flags; first non-flag token (that isn't a bare '-') is
+        # the target user. Default target is root.
+        target = "root"
+        for t in toks[1:]:
+            if t == "-" or t.startswith("-"):
+                continue
+            target = t
+            break
+        return CmdMutation(kind="push_user", user=target)
+
+    if toks[0] == "sudo":
+        rest = toks[1:]
+        # `sudo -u USER ...` sets the target; otherwise root.
+        target = "root"
+        i = 0
+        becomes_shell = False
+        while i < len(rest):
+            t = rest[i]
+            if t in ("-u", "--user") and i + 1 < len(rest):
+                target = rest[i + 1]
+                i += 2
+                continue
+            if t in ("-i", "--login", "-s", "--shell"):
+                becomes_shell = True
+                i += 1
+                continue
+            if t.startswith("-"):
+                i += 1
+                continue
+            # First positional: `sudo su [-] [USER]` is a persistent shell.
+            if t == "su":
+                becomes_shell = True
+                for u in rest[i + 1:]:
+                    if u == "-" or u.startswith("-"):
+                        continue
+                    target = u
+                    break
+            break
+        if becomes_shell:
+            return CmdMutation(kind="push_user", user=target)
+        return None
+
+    return None

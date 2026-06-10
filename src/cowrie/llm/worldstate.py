@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal
 
 FileSource = Literal["downloaded", "created", "edited"]
 
@@ -19,35 +19,56 @@ FileSource = Literal["downloaded", "created", "edited"]
 class FileFact:
     path: str
     size_bytes: int
-    sha256: Optional[str]
+    sha256: str | None
     mtime: float
     source: FileSource
-    source_url: Optional[str] = None
-    content_snippet: Optional[str] = None
+    source_url: str | None = None
+    content_snippet: str | None = None
+
+
+@dataclass
+class ProcessFact:
+    """A process the session started — backgrounded jobs (`cmd &`),
+    nohup'd payloads, etc. Tracked so `ps` / `jobs` / `kill` stay
+    consistent with what the attacker actually launched."""
+
+    pid: int
+    command: str
+    user: str
+    started_at: float = field(default_factory=time.time)
 
 
 @dataclass
 class WorldState:
     files: dict[str, FileFact] = field(default_factory=dict)
     env_vars: dict[str, str] = field(default_factory=dict)
+    processes: dict[int, ProcessFact] = field(default_factory=dict)
     bg_pids: list[int] = field(default_factory=list)
+    # Stack of effective usernames pushed by su / sudo -i. Empty means the
+    # session's login user is in effect. The top of the stack is the
+    # current effective user (drives whoami / id / the shell prompt).
     user_stack: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
+
+    # PIDs we hand out for backgrounded jobs start here and increment, so
+    # they look like real mid-life process IDs rather than 1/2/3.
+    _next_pid: int = 17000
 
     # Cap how many files we serialize into the prompt. 20 is plenty —
     # attacker workflows that drop dozens of files are rare, and the
     # prompt cost matters once the cache is busted.
     MAX_FILES_IN_PROMPT = 20
+    MAX_PROCS_IN_PROMPT = 20
 
     def add_file(
         self,
         *,
         path: str,
         size_bytes: int = 0,
-        sha256: Optional[str] = None,
+        sha256: str | None = None,
         source: FileSource = "downloaded",
-        source_url: Optional[str] = None,
-        content_snippet: Optional[str] = None,
+        source_url: str | None = None,
+        content_snippet: str | None = None,
     ) -> None:
         """Idempotent — last-write-wins on the same path."""
         if not path:
@@ -66,13 +87,47 @@ class WorldState:
         if name:
             self.env_vars[name] = value
 
+    def add_process(self, command: str, *, user: str, pid: int | None = None) -> int:
+        """Register a backgrounded process and return its PID.
+
+        Used when the attacker launches `cmd &` / `nohup cmd &`. The PID is
+        also appended to ``bg_pids`` so `jobs` and `$!` stay consistent.
+        """
+        command = (command or "").strip()
+        if not command:
+            return 0
+        if pid is None:
+            pid = self._next_pid
+            self._next_pid += 1
+        self.processes[pid] = ProcessFact(pid=pid, command=command, user=user)
+        if pid not in self.bg_pids:
+            self.bg_pids.append(pid)
+        return pid
+
+    def push_user(self, user: str) -> None:
+        """Record a su / sudo -i into ``user`` (an effective-user change)."""
+        if user:
+            self.user_stack.append(user)
+
+    def pop_user(self) -> str | None:
+        """Undo the most recent user switch (an `exit` from a su subshell)."""
+        if self.user_stack:
+            return self.user_stack.pop()
+        return None
+
+    def effective_user(self, login_user: str) -> str:
+        """Current effective user: top of the su/sudo stack, or login user."""
+        return self.user_stack[-1] if self.user_stack else login_user
+
     def to_prompt_section(self) -> str:
         """Render for the LLM system prompt.
 
         Returns the empty string when there's nothing to share (so the
         caller can omit the segment entirely and keep the cache hot).
         """
-        if not (self.files or self.env_vars or self.bg_pids or self.user_stack):
+        if not (
+            self.files or self.env_vars or self.processes or self.user_stack
+        ):
             return ""
 
         lines: list[str] = [
@@ -107,12 +162,18 @@ class WorldState:
             for k, v in list(self.env_vars.items())[:10]:
                 lines.append(f"  {k}={v!r}")
 
-        if self.bg_pids:
-            lines.append(f"Background job PIDs in this session: {self.bg_pids}")
+        if self.processes:
+            lines.append(
+                "Background processes this session started "
+                "(must appear in ps/jobs output until killed):"
+            )
+            for p in list(self.processes.values())[: self.MAX_PROCS_IN_PROMPT]:
+                lines.append(f"  pid={p.pid} user={p.user} cmd={p.command!r}")
 
         if self.user_stack:
             lines.append(
-                f"User-switch stack (su/sudo): {' -> '.join(self.user_stack)}"
+                "Effective-user stack (su/sudo — whoami/id and the shell "
+                f"prompt must reflect the top): {' -> '.join(self.user_stack)}"
             )
 
         return "\n".join(lines)

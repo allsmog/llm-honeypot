@@ -29,6 +29,7 @@ from twisted.web.iweb import IBodyProducer, IResponse
 from zope.interface import implementer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from configparser import ConfigParser
 
 
@@ -71,7 +72,7 @@ class LLMRequest:
     usage: dict[str, int] = field(default_factory=dict)
 
 
-def _normalize_anthropic_usage(payload_usage: dict) -> dict[str, int]:
+def _normalize_anthropic_usage(payload_usage: object) -> dict[str, int]:
     """Map Anthropic Messages API usage shape to our common keys."""
     if not isinstance(payload_usage, dict):
         return {}
@@ -94,7 +95,7 @@ def _normalize_anthropic_usage(payload_usage: dict) -> dict[str, int]:
     return out
 
 
-def _normalize_openai_usage(payload_usage: dict) -> dict[str, int]:
+def _normalize_openai_usage(payload_usage: object) -> dict[str, int]:
     """Map OpenAI chat-completions / Responses API usage to our keys."""
     if not isinstance(payload_usage, dict):
         return {}
@@ -235,7 +236,7 @@ class LLMProvider(ABC):
         return False
 
     def generate_streaming(
-        self, request: LLMRequest, on_chunk: "Callable[[str], None]",
+        self, request: LLMRequest, on_chunk: Callable[[str], None],
     ) -> Deferred:
         """Stream the response, calling on_chunk(text) for each delta.
 
