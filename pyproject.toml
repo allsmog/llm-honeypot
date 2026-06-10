@@ -271,11 +271,12 @@ legacy_tox_ini = """
     basepython = python3.10
 
     [testenv:fidelity]
-    description = honeypot believability gate: deterministic-responder consistency invariants must hold for every persona (exits non-zero on any contradiction)
+    description = honeypot believability gate: consistency invariants must hold for every persona, plus a structural-drift tripwire comparing the Ubuntu persona to the real CI host shell
     setenv =
         PYTHONPATH = {toxinidir}/src
     commands =
         python {toxinidir}/scripts/fidelity_eval.py --all-personas
+        python {toxinidir}/scripts/fidelity_eval.py --persona ubuntu_22_04 --reference local
     basepython = python3.10
 
     [testenv:typing]

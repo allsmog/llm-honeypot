@@ -35,9 +35,10 @@ from cowrie.llm import fidelity
 from cowrie.llm.persona import PERSONAS
 
 
-def _eval_persona(slug: str, *, reference: bool) -> bool:
+def _eval_persona(slug: str, *, reference: bool, min_similarity: float) -> bool:
     ctx = fidelity.build_context(slug)
     print(f"\n=== persona: {slug}  ({ctx.persona.distro}) ===")
+    ok = True
 
     # Consistency
     checks = fidelity.run_consistency(ctx)
@@ -46,6 +47,7 @@ def _eval_persona(slug: str, *, reference: bool) -> bool:
     print(f"consistency: {passed}/{len(checks)} invariants hold")
     for c in failed:
         print(f"  FAIL  {c.name}: {c.detail}")
+    ok = ok and not failed
 
     # Coverage
     cov = fidelity.coverage(ctx)
@@ -65,13 +67,21 @@ def _eval_persona(slug: str, *, reference: bool) -> bool:
             print(f"reference:   mean structural similarity {mean * 100:.1f}% "
                   f"over {len(scored)} commands run on host")
             for r in sorted(scored, key=lambda x: x.similarity):
-                flag = "  " if r.similarity >= 0.80 else "LOW"
+                flag = "FAIL" if r.similarity < min_similarity else (
+                    "  " if r.similarity >= 0.80 else "low ")
                 print(f"  {flag} {r.similarity * 100:5.1f}%  {r.command}")
+            # Per-command floor: a gross structural break (e.g. a 12-line
+            # /proc/meminfo where a real one is ~54) trips this.
+            below = [r for r in scored if r.similarity < min_similarity]
+            if below:
+                ok = False
+                print(f"  {len(below)} command(s) below the "
+                      f"{min_similarity * 100:.0f}% structural floor")
         skipped = [r for r in refs if not r.ran_on_host]
         for r in skipped:
             print(f"  skip  {r.command}  ({r.note})")
 
-    return not failed
+    return ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,19 +93,25 @@ def main(argv: list[str] | None = None) -> int:
                     help="evaluate every built-in persona")
     ap.add_argument("--reference", choices=["none", "local"], default="none",
                     help="'local' compares output to the real host shell")
+    ap.add_argument("--min-similarity", type=float, default=0.25,
+                    help="per-command structural-similarity floor for "
+                         "--reference (gross-break tripwire; default 0.25)")
     args = ap.parse_args(argv)
 
     slugs = [p.slug for p in PERSONAS] if args.all_personas else [args.persona]
     all_ok = True
     for slug in slugs:
-        ok = _eval_persona(slug, reference=(args.reference == "local"))
+        ok = _eval_persona(slug, reference=(args.reference == "local"),
+                           min_similarity=args.min_similarity)
         all_ok = all_ok and ok
 
     print()
     if all_ok:
-        print("RESULT: all consistency invariants hold.")
+        print("RESULT: all consistency invariants hold"
+              + (" and structural similarity within floor." if args.reference == "local"
+                 else "."))
         return 0
-    print("RESULT: consistency FAILURES detected (see above).")
+    print("RESULT: FAILURES detected (see above).")
     return 1
 
 

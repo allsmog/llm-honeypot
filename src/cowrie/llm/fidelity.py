@@ -81,13 +81,16 @@ RECON_CORPUS: tuple[tuple[str, str], ...] = (
 )
 
 # A subset that's universally present on a stock Linux box and safe/quick to
-# run for structural reference comparison. Excludes things a minimal image
-# may lack (lscpu, w) — those are skipped gracefully if the binary is absent.
+# run for structural reference comparison. Deliberately excludes commands
+# whose *shape* varies wildly by host rather than by honeypot fidelity —
+# `env` (shell-injected vars) and `/proc/mounts` (overlayfs/cgroups on a
+# container vs ext4 on a VPS) — and anything a minimal image may lack
+# (lscpu, w), which is skipped gracefully when the binary is absent.
 SAFE_REFERENCE_COMMANDS: tuple[str, ...] = (
     "whoami", "id", "uname -a", "uname -r", "uname -m", "arch", "nproc",
-    "uptime", "hostname", "free", "date", "groups", "env",
+    "uptime", "hostname", "free", "date", "groups",
     "cat /proc/cpuinfo", "cat /proc/meminfo", "cat /etc/os-release",
-    "df", "df -h", "vmstat", "cat /proc/mounts",
+    "df", "df -h", "vmstat",
 )
 
 
