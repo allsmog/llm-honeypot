@@ -16,7 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import cmd_parser, downloader
+from cowrie.llm import attack_map, cmd_parser, downloader
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
 from cowrie.llm import responder as respondermod
@@ -177,6 +177,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         string = line.decode("utf8")
 
         log.msg(eventid="cowrie.command.input", input=string, format="CMD: %(input)s")
+        self._emit_attack_techniques(string)
 
         if self._try_fastpath(string):
             return
@@ -197,6 +198,29 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         if self._try_download_intercept(string):
             return
         self._process_command_with_llm(string)
+
+    def _emit_attack_techniques(self, command: str) -> None:
+        """Tag the command with MITRE ATT&CK techniques for threat intel.
+
+        Emitted as ``cowrie.llm.attack`` alongside the command stream so a
+        SIEM can pivot on technique ids (T1105, T1496, ...) instead of
+        re-deriving them from raw command text. Best-effort: classification
+        never raises, and no event fires when nothing is evidenced.
+        """
+        if not CowrieConfig.getboolean("llm", "attack_mapping", fallback=True):
+            return
+        techniques = attack_map.classify(command)
+        if not techniques:
+            return
+        log.msg(
+            eventid="cowrie.llm.attack",
+            input=command,
+            techniques=[t.id for t in techniques],
+            technique_names=[t.name for t in techniques],
+            tactics=sorted({t.tactic for t in techniques}),
+            sessionno=f"S{self.sessionno}",
+            format="ATT&CK: %(input)s",
+        )
 
     def _try_deterministic(self, command: str) -> bool:
         """Render ``command`` from local state if we can. Returns True iff

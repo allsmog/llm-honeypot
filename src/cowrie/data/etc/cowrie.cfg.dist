@@ -520,6 +520,15 @@ log_raw = false
 # (default: true)
 #deterministic_responses = true
 
+# MITRE ATT&CK mapping. Every attacker command is classified into the
+# techniques it evidences (T1105 Ingress Tool Transfer, T1496 Resource
+# Hijacking, T1053.003 Cron persistence, ...) and emitted as a
+# `cowrie.llm.attack` event with technique ids, names, and tactics — so a
+# SIEM can pivot on technique rather than re-deriving it from raw command
+# text. Pure pattern matching, no model call, runs on every line.
+# (default: true)
+#attack_mapping = true
+
 # Conversation recency window (number of past turns replayed to the LLM
 # each request). Durable session facts (downloaded files, env vars,
 # background processes, su/sudo user stack) live in the WorldState prompt

