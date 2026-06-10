@@ -436,6 +436,77 @@ class TestDeterministicPath(unittest.TestCase):
         self.assertEqual(len(self.stub.calls), 1)
 
 
+class TestInteractivePrograms(unittest.TestCase):
+    """Full-screen programs take over the terminal and exit on the right key."""
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+
+    def tearDown(self) -> None:
+        # Ensure no refresh timer is left armed.
+        try:
+            self.proto._exit_program()
+        except Exception:
+            pass
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_vi_enters_program_mode(self):
+        self.tr.clear()
+        self.proto.lineReceived(b"vi /tmp/new.sh")
+        self.assertIsNotNone(self.proto._program)
+        self.assertEqual(len(self.stub.calls), 0)  # no LLM call
+        self.assertIn(b"\x1b[2J", self.tr.value())  # alternate screen
+        self.assertIn(b"new.sh", self.tr.value())
+
+    def test_vi_colon_q_exits_to_prompt(self):
+        self.proto.lineReceived(b"vi /tmp/x")
+        self.assertIsNotNone(self.proto._program)
+        self.tr.clear()
+        for key in (b":", b"q", b"\r"):
+            self.proto.keystrokeReceived(key, None)
+        self.assertIsNone(self.proto._program)         # back to shell
+        self.assertIn(b"@", self.tr.value())           # prompt redrawn
+
+    def test_top_enters_then_q_exits(self):
+        from twisted.internet import reactor as _reactor
+        from twisted.internet import task
+        clock = task.Clock()
+        self.patch(_reactor, "callLater", clock.callLater)
+        self.proto.lineReceived(b"top")
+        self.assertIsNotNone(self.proto._program)
+        self.assertIn(b"load average", self.tr.value())
+        self.tr.clear()
+        self.proto.keystrokeReceived(b"q", None)
+        self.assertIsNone(self.proto._program)
+
+    def test_top_bn1_is_deterministic_not_interactive(self):
+        # Batch top is handled by the deterministic responder, NOT program mode.
+        self.proto.lineReceived(b"top -bn1")
+        self.assertIsNone(self.proto._program)
+        self.assertIn(b"%Cpu", self.tr.value())
+
+    def test_keystrokes_in_program_mode_dont_reach_shell(self):
+        self.proto.lineReceived(b"vi /tmp/x")
+        # A stray 'x' keypress edits the (fake) buffer, not the shell line.
+        self.proto.keystrokeReceived(b"x", None)
+        self.assertIsNotNone(self.proto._program)  # still in vi
+
+    def test_disabling_interactive_routes_to_llm(self):
+        from cowrie.core.config import CowrieConfig
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        CowrieConfig.set("llm", "interactive_programs", "false")
+        self.addCleanup(
+            lambda: CowrieConfig.remove_option("llm", "interactive_programs")
+        )
+        self.proto.lineReceived(b"vi /tmp/x")
+        self.assertIsNone(self.proto._program)
+        self.assertEqual(len(self.stub.calls), 1)  # went to the LLM
+
+
 class TestSuFlow(unittest.TestCase):
     """su/sudo changes the effective user, the prompt sigil, and exit pops."""
 

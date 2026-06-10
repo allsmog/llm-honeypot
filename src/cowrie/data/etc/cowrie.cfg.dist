@@ -520,6 +520,15 @@ log_raw = false
 # (default: true)
 #deterministic_responses = true
 
+# Full-screen interactive programs. top/htop, vi/vim, and less/more take
+# over the terminal (alternate screen + raw keystrokes) instead of being
+# narrated one-shot by the LLM — the classic vim/top honeypot tell. The
+# program repaints (top refreshes every few seconds) and exits the way the
+# attacker expects (top: q; vi: :q / :q! / :wq / ZZ; less: q / space). Set
+# false to route these to the LLM instead.
+# (default: true)
+#interactive_programs = true
+
 # MITRE ATT&CK mapping. Every attacker command is classified into the
 # techniques it evidences (T1105 Ingress Tool Transfer, T1496 Resource
 # Hijacking, T1053.003 Cron persistence, ...) and emitted as a

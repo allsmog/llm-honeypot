@@ -17,6 +17,7 @@ from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
 from cowrie.llm import attack_map, cmd_parser, downloader, scp
+from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
 from cowrie.llm import responder as respondermod
@@ -70,6 +71,10 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # Fastpath commands (cd, pwd, exit, clear) don't count.
         self._command_count = 0
         self._budget_exhausted_logged = False
+        # Full-screen program mode (top/vi/less): when set, keystrokes are
+        # routed to the program instead of the line editor.
+        self._program = None
+        self._refresh_call = None
 
     def getProtoTransport(self):
         """
@@ -195,9 +200,111 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # through to the download interceptor / LLM unchanged.
         if self._try_deterministic(string):
             return
+        # Full-screen programs (top/htop, vi/vim, less/more) take over the
+        # terminal — render the alternate screen and route subsequent keys
+        # to the program until the attacker exits (q, :q, ...).
+        if self._try_interactive(string):
+            return
         if self._try_download_intercept(string):
             return
         self._process_command_with_llm(string)
+
+    def _try_interactive(self, command: str) -> bool:
+        """Enter full-screen program mode if ``command`` launches one.
+
+        Only meaningful for the interactive (PTY) protocol; the exec path
+        is one-shot and never calls lineReceived. Any failure bails to the
+        normal path rather than risk wedging the session.
+        """
+        if getattr(self, "terminal", None) is None:
+            return False
+        if not CowrieConfig.getboolean(
+            "llm", "interactive_programs", fallback=True
+        ):
+            return False
+        try:
+            ctx = self._shell_context()
+
+            def top_frame() -> str:
+                r = respondermod.respond("top -bn1", ctx)
+                return r.output if r is not None else "top - load average: 0.00\n"
+
+            rows, cols = self._terminal_size()
+            prog = interactivemod.make_program(
+                command,
+                file_content=lambda p: self._program_file_content(p, ctx),
+                top_frame=top_frame,
+                rows=rows,
+                cols=cols,
+            )
+        except Exception:
+            return False
+        if prog is None:
+            return False
+        self._program = prog
+        try:
+            if self.terminal is not None:
+                self.terminal.write(prog.render_initial())
+            self._schedule_program_refresh()
+        except Exception:
+            self._program = None
+            return False
+        return True
+
+    def _terminal_size(self) -> tuple[int, int]:
+        ws = getattr(getattr(self.user, "server", None), "windowSize", None)
+        if isinstance(ws, (tuple, list)) and len(ws) >= 2:
+            return int(ws[0]) or 24, int(ws[1]) or 80
+        return 24, 80
+
+    def _program_file_content(self, path, ctx) -> str | None:
+        """Text for an editor/pager to display, or None (new/unknown file).
+
+        Prefers the real bytes the session captured (WorldState content),
+        then a deterministic `cat` of a known file; otherwise None so the
+        editor opens an empty buffer / the pager declines.
+        """
+        resolved = respondermod._resolve_path(path, ctx)
+        fact = ctx.world.files.get(resolved)
+        if fact is not None and fact.content_snippet:
+            return fact.content_snippet
+        cat = respondermod.respond(f"cat {resolved}", ctx)
+        if cat is not None and cat.output and "No such file" not in cat.output:
+            return cat.output.rstrip("\n")
+        return None
+
+    def _schedule_program_refresh(self) -> None:
+        prog = getattr(self, "_program", None)
+        if prog is None or prog.refresh_interval <= 0:
+            return
+        from twisted.internet import reactor
+        self._refresh_call = reactor.callLater(
+            prog.refresh_interval, self._do_program_refresh
+        )
+
+    def _do_program_refresh(self) -> None:
+        self._refresh_call = None
+        prog = getattr(self, "_program", None)
+        if prog is None or self.terminal is None:
+            return
+        try:
+            self.terminal.write(prog.on_refresh())
+        except Exception:
+            self._exit_program()
+            return
+        self._schedule_program_refresh()
+
+    def _exit_program(self) -> None:
+        """Leave program mode and redraw the shell prompt."""
+        call = getattr(self, "_refresh_call", None)
+        if call is not None:
+            try:
+                call.cancel()
+            except Exception:
+                pass
+        self._refresh_call = None
+        self._program = None
+        self._show_prompt()
 
     def _emit_attack_techniques(self, command: str) -> None:
         """Tag the command with MITRE ATT&CK techniques for threat intel.
@@ -958,6 +1065,15 @@ class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLin
         HoneyPotBaseProtocol.timeoutConnection(self)
 
     def connectionLost(self, reason):
+        # Cancel any pending full-screen refresh timer before teardown.
+        call = getattr(self, "_refresh_call", None)
+        if call is not None:
+            try:
+                call.cancel()
+            except Exception:
+                pass
+            self._refresh_call = None
+        self._program = None
         HoneyPotBaseProtocol.connectionLost(self, reason)
         recvline.HistoricRecvLine.connectionLost(self, reason)
         self.keyHandlers = {}
@@ -967,6 +1083,22 @@ class HoneyPotInteractiveProtocol(HoneyPotBaseProtocol, recvline.HistoricRecvLin
         Overriding super to prevent terminal.reset()
         """
         self.setInsertMode()
+
+    def keystrokeReceived(self, keyID, modifier):
+        # In full-screen program mode (top/vi/less), keystrokes drive the
+        # program, not the line editor. Any error exits cleanly to the shell
+        # rather than wedging the session.
+        if getattr(self, "_program", None) is not None:
+            try:
+                res = self._program.handle_key(keyID)
+                if self.terminal is not None and res.output:
+                    self.terminal.write(res.output)
+                if res.done:
+                    self._exit_program()
+            except Exception:
+                self._exit_program()
+            return
+        recvline.HistoricRecvLine.keystrokeReceived(self, keyID, modifier)
 
     def characterReceived(self, ch, moreCharactersComing):
         if self.terminal is None:

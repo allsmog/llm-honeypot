@@ -297,14 +297,18 @@ coverage report --include='*/cowrie/llm/*'
   source. Residual: only the SCP exec-channel form is captured; a `scp`
   *typed at the interactive shell* is still narrated as permission-denied
   by the LLM (that path never carries the binary stream).
-- **Full-screen interactive programs defer to the LLM.** Bounded/batch
-  forms are rendered deterministically and correctly — `top -bn1`,
-  `ping -c N`, `vmstat` — because those exit on their own. But truly
-  interactive, TTY-grabbing programs (`vim`, `nano`, `htop`, bare `top`,
-  `less`, `watch`) can't be faithfully emulated in the line-oriented
-  protocol, so they fall through to the LLM, which the hardened prompt
-  instructs to render a realistic initial frame. A skilled human driving a
-  real PTY can still tell; automated tooling generally can't.
+- **Full-screen interactive programs are emulated, with residuals.**
+  `top`/`htop`, `vi`/`vim`, and `less`/`more` take over the terminal
+  (alternate screen + raw keystrokes via `cowrie/llm/interactive.py`): the
+  program paints a believable screen, `top` repaints on its refresh timer,
+  pagers/editors show the real file content (from the VFS/WorldState), and
+  each exits the way the attacker expects (`top`: q; `vi`: `:q`/`:q!`/
+  `:wq`/`ZZ`; `less`: q / space-at-end). Residuals: it's not a real editor
+  (no insert/edit, no search), `nano`/`emacs`/`watch` still defer to the
+  LLM, and `top`'s process list is a static frame that updates rather than
+  live-sampled. A skilled human probing editor internals can still tell;
+  automated tooling and casual operators generally can't. Toggle with
+  `[llm] interactive_programs`.
 - **Streaming responses are off by default.** Anthropic providers
   support it (`[llm] stream = true`); enabling it makes responses
   drip to the terminal rather than appear in one block, which is
