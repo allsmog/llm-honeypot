@@ -37,7 +37,7 @@ adduser --disabled-password --gecos "" honeypot
 
 ```bash
 sudo -iu honeypot
-git clone https://github.com/your-user/llm-honeypot.git
+git clone https://github.com/allsmog/llm-honeypot.git
 cd llm-honeypot
 python3.11 -m venv .venv
 .venv/bin/pip install -e .
