@@ -19,6 +19,7 @@ from twisted.trial import unittest
 from twisted.web.http_headers import Headers
 
 from cowrie.llm.providers import ProviderRegistry
+from cowrie.llm.providers import base as base_module
 from cowrie.llm.providers.anthropic_apikey import AnthropicAPIKeyProvider
 from cowrie.llm.providers.anthropic_oauth import AnthropicOAuthProvider
 from cowrie.llm.providers.base import LLMMessage, LLMRequest
@@ -93,10 +94,14 @@ def _config(overrides: dict[str, str]) -> configparser.ConfigParser:
 
 
 class TestRegistry(unittest.TestCase):
-    def test_all_four_providers_registered(self):
-        self.assertEqual(
-            set(ProviderRegistry.available()),
+    def test_builtin_providers_registered(self):
+        # Superset, not equality: an exact-set assertion turns the suite
+        # red the moment anyone registers a provider, which punishes the
+        # extension this abstraction exists to support. Open-registry
+        # coverage lives in test_llm_provider_conformance.py.
+        self.assertLessEqual(
             {"anthropic_apikey", "anthropic_oauth", "codex_apikey", "codex_oauth"},
+            set(ProviderRegistry.available()),
         )
 
     def test_unknown_provider_raises(self):
@@ -420,3 +425,66 @@ class TestAuthReload(unittest.TestCase):
         result = self.successResultOf(provider.generate(request))
         self.assertEqual(result, "")
         self.assertEqual(len(provider.agent.requests), 1)
+
+
+class _HangingAgent:
+    """An agent whose request never fires — a server that accepts the
+    connection and then stalls."""
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, method, uri, headers=None, bodyProducer=None):
+        self.requests.append(uri)
+        return defer.Deferred()  # never called back
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """A stalled backend must not strand the SSH session.
+
+    Without a ceiling the Deferred is held forever and the attacker sits at
+    a dead prompt until [honeypot] interactive_timeout reaps the session
+    three minutes later. Much likelier against a self-hosted model server
+    than a hosted API, which is where the LangChain path points.
+    """
+
+    def _provider(self, timeout="0.5"):
+        cfg = _config({"anthropic_api_key": "sk-ant-x", "request_timeout_seconds": timeout})
+        provider = AnthropicAPIKeyProvider(cfg)
+        provider.agent = _HangingAgent()
+        return provider
+
+    def test_stalled_request_resolves_to_empty_string(self):
+        """A backend that accepts and then stalls must not strand the turn.
+
+        Driven off a virtual clock, so the test does not sleep. Note the
+        timeout has to wrap the whole callback chain rather than just the
+        agent call: applied to agent.request alone, the "" it produces
+        flows on into _read_body, which expects a Response object.
+        """
+        from twisted.internet import task
+
+        clock = task.Clock()
+        provider = self._provider()
+        original_reactor = base_module.reactor
+        base_module.reactor = clock
+        try:
+            d = provider.generate(
+                LLMRequest(messages=[LLMMessage(role="user", content="hi")])
+            )
+            self.assertNoResult(d)
+            clock.advance(0.6)
+            self.assertEqual(self.successResultOf(d), "")
+        finally:
+            base_module.reactor = original_reactor
+
+    def test_timeout_is_configurable_and_disablable(self):
+        self.assertEqual(self._provider("12").request_timeout, 12.0)
+        # 0 disables the ceiling entirely — the deferred is returned as-is.
+        provider = self._provider("0")
+        d: defer.Deferred = defer.Deferred()
+        self.assertIs(provider._with_timeout(d, "request"), d)
+
+    def test_default_timeout_is_applied(self):
+        cfg = _config({"anthropic_api_key": "sk-ant-x"})
+        self.assertEqual(AnthropicAPIKeyProvider(cfg).request_timeout, 30.0)

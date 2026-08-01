@@ -96,12 +96,10 @@ class CodexOAuthProvider(LLMProvider):
         # is rejected ("Unsupported parameter"), and the standard sampling
         # knobs aren't honored either. We pass only what's accepted; honeypot
         # responses are short by nature so token-cap loss is acceptable.
-        # Responses API takes a single `instructions` string. Concatenate
-        # any system_blocks (the cache-segmented shape Anthropic uses) —
-        # we lose the cache breakpoint signal but keep the content.
-        instructions = request.system
-        if request.system_blocks:
-            instructions = "\n\n".join(t for t, _ in request.system_blocks if t)
+        # Responses API takes a single `instructions` string. system_text()
+        # flattens any system_blocks (the cache-segmented shape Anthropic
+        # uses) — we lose the cache breakpoint signal but keep the content.
+        instructions = request.system_text()
         body: dict[str, Any] = {
             "model": self._model,
             "instructions": instructions or "",
@@ -142,9 +140,11 @@ class CodexOAuthProvider(LLMProvider):
                 # Capture token usage from the final SSE event. The
                 # Codex Responses API exposes input_tokens/output_tokens
                 # under response.usage.
-                from cowrie.llm.providers.base import _normalize_openai_usage
                 if isinstance(resp.get("usage"), dict):
-                    request.usage.update(_normalize_openai_usage(resp["usage"]))
+                    # Route through the hook rather than the module-level
+                    # OpenAI normalizer, so a subclass overriding
+                    # _normalize_usage is honored on this path too.
+                    request.usage.update(self._normalize_usage(resp["usage"]))
                 if isinstance(resp.get("output_text"), str):
                     completed_text = resp["output_text"]
                 else:

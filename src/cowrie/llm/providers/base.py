@@ -71,6 +71,25 @@ class LLMRequest:
     system_blocks: list[tuple[str, bool]] | None = None
     usage: dict[str, int] = field(default_factory=dict)
 
+    def system_text(self) -> str:
+        """The system prompt as one string. Use this unless you split blocks.
+
+        This exists to make a specific silent failure impossible. The
+        interactive protocol only ever populates ``system_blocks`` —
+        ``system`` stays empty — so a provider that reads ``request.system``
+        directly sends *no system prompt at all*: no persona, no world
+        state, no instructions. The honeypot still answers, plausibly
+        enough that nothing looks broken, while being a generic assistant
+        rather than the machine it is pretending to be.
+
+        Only providers that genuinely act on the per-block ``cacheable``
+        flag (the Anthropic ones, which turn it into cache breakpoints)
+        should touch ``system_blocks`` themselves.
+        """
+        if self.system_blocks:
+            return "\n\n".join(text for text, _ in self.system_blocks if text)
+        return self.system
+
 
 def _normalize_anthropic_usage(payload_usage: object) -> dict[str, int]:
     """Map Anthropic Messages API usage shape to our common keys."""
@@ -110,6 +129,14 @@ def _normalize_openai_usage(payload_usage: object) -> dict[str, int]:
         out["input_tokens"] = int(payload_usage["input_tokens"])
     if "output_tokens" in payload_usage and "output_tokens" not in out:
         out["output_tokens"] = int(payload_usage["output_tokens"])
+    # Cache hits. OpenAI nests these one level down, which is why cache
+    # telemetry read as Anthropic-only before: the keys were simply never
+    # looked for on this path.
+    details = payload_usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        cached = int(details["cached_tokens"])
+        if cached:
+            out["cached_tokens"] = cached
     if "total_tokens" in payload_usage:
         out["total_tokens"] = int(payload_usage["total_tokens"])
     else:
@@ -170,6 +197,15 @@ class LLMProvider(ABC):
         self.debug = config.getboolean("llm", "debug", fallback=False)
         self.max_tokens = config.getint("llm", "max_tokens", fallback=500)
         self.temperature = config.getfloat("llm", "temperature", fallback=0.7)
+        # Wall-clock ceiling on a single upstream call. Without one, a
+        # backend that accepts the connection and then stalls holds the
+        # session's Deferred forever: the attacker sits at a dead prompt
+        # until [honeypot] interactive_timeout (180s) reaps the session.
+        # Far likelier against a self-hosted model server than a hosted
+        # API, which is exactly where the LangChain path points.
+        self.request_timeout = config.getfloat(
+            "llm", "request_timeout_seconds", fallback=30.0
+        )
         self._pool = HTTPConnectionPool(reactor)
         self._pool._factory = _QuietHTTP11ClientFactory
 
@@ -189,7 +225,9 @@ class LLMProvider(ABC):
             )
             log.msg(f"LLM[{self.name}] using proxy {parsed.hostname}:{parsed.port}")
         else:
-            self.agent = Agent(reactor, pool=self._pool)
+            self.agent = Agent(
+                reactor, pool=self._pool, connectTimeout=self.request_timeout
+            )
 
     # ------------------------------------------------------------------
     # Subclass contract
@@ -280,13 +318,33 @@ class LLMProvider(ABC):
 
                 d_body.addCallback(on_body)
                 return d_body
-            consumer, completion = make_streaming_consumer(resp.code, on_chunk)
+            consumer, completion = make_streaming_consumer(
+                resp.code, on_chunk, self._parse_stream_event
+            )
             resp.deliverBody(consumer)
 
             def on_stream_done(result):
-                text, usage = result
-                if isinstance(usage, dict):
-                    request.usage.update(_normalize_anthropic_usage(usage))
+                text, usage, diagnosis = result
+                if isinstance(usage, dict) and usage:
+                    request.usage.update(self._normalize_usage(usage))
+                if diagnosis:
+                    # A stream that yields nothing must never be served as
+                    # an empty response. Before this, a provider whose wire
+                    # format the parser did not recognize produced a blank
+                    # shell with nothing logged anywhere — the worst
+                    # failure mode available to a honeypot, because it is
+                    # both broken and invisible. Say so, then answer the
+                    # turn properly with a buffered call.
+                    log.msg(
+                        eventid="cowrie.llm.error",
+                        provider=self.name,
+                        error=diagnosis,
+                        format=(
+                            "LLM[%(provider)s] streaming produced no text "
+                            "(%(error)s) — falling back to buffered request"
+                        ),
+                    )
+                    return self._generate(request, retried=False)
                 return text
 
             completion.addCallback(on_stream_done)
@@ -297,12 +355,55 @@ class LLMProvider(ABC):
             return ""
 
         d.addCallbacks(on_response, on_request_failure)
-        return d
+        return self._with_timeout(d, "streaming request")
 
     def _format_streaming_body(self, request: LLMRequest) -> dict:
         """Default: same as _format_body. Anthropic providers override
         to also set ``stream: true``."""
         return self._format_body(request)
+
+    def _parse_stream_event(self, event: dict) -> tuple[str | None, dict | None]:
+        """Decode one SSE event into (text_delta, usage).
+
+        Default is the Anthropic Messages shape. **Override alongside
+        _supports_streaming** for any other wire format — OpenAI
+        chat-completions chunks, for instance, carry no ``type``
+        discriminator at all, so the default matches nothing and the whole
+        stream comes back empty. ``providers.streaming.parse_openai_event``
+        is supplied for that case.
+        """
+        from cowrie.llm.providers.streaming import parse_anthropic_event
+
+        return parse_anthropic_event(event)
+
+    def _with_timeout(self, d: Deferred, what: str) -> Deferred:
+        """Bound a Deferred by request_timeout, resolving to "" on expiry.
+
+        connectTimeout on the Agent only covers establishing the TCP
+        connection. A server that accepts and then stalls — a wedged local
+        model, an overloaded gateway — is the case that actually strands
+        the session, so the whole round trip needs a ceiling too.
+
+        Resolves rather than fails, matching this class's standing contract
+        that provider trouble yields an empty response and a log line: the
+        SSH session must keep going regardless.
+        """
+        if self.request_timeout <= 0:
+            return d
+
+        def on_timeout(failure):
+            failure.trap(defer.CancelledError, defer.TimeoutError)
+            log.msg(
+                eventid="cowrie.llm.error",
+                provider=self.name,
+                error=f"{what} timed out after {self.request_timeout:g}s",
+                format="LLM[%(provider)s] %(error)s",
+            )
+            return ""
+
+        d.addTimeout(self.request_timeout, reactor)
+        d.addErrback(on_timeout)
+        return d
 
     def _generate(self, request: LLMRequest, retried: bool) -> Deferred:
         body = self._format_body(request)
@@ -320,7 +421,12 @@ class LLMProvider(ABC):
         # decide whether to reload-and-retry on 401 without stashing state
         # on self (which would race across overlapping sessions).
         d.addCallback(self._handle_status, request, retried)
-        return d
+        # Timeout wraps the *whole* chain, not just agent.request. Two
+        # reasons: a server can accept the connection and then stall
+        # mid-body, which only a whole-round-trip ceiling catches; and the
+        # timeout's "" result must be the chain's final value rather than
+        # being fed into _read_body, which expects a Response.
+        return self._with_timeout(d, "request")
 
     def _on_auth_failure(self) -> bool:
         """Hook for providers backed by refreshable credentials.
@@ -400,21 +506,37 @@ class LLMProvider(ABC):
         self._capture_usage(payload, request)
         return self._parse_response(payload)
 
-    def _capture_usage(self, payload: dict, request: LLMRequest) -> None:
-        """Default: try both Anthropic and OpenAI shapes; first match wins.
+    def _normalize_usage(self, usage: dict) -> dict[str, int]:
+        """Map this provider's usage shape onto the common keys.
 
-        Override in providers that need different shapes (Codex OAuth's
-        SSE-delivered usage lives inside the response.completed event).
+        Common keys: input_tokens, output_tokens, cached_tokens,
+        cache_creation_tokens, total_tokens.
+
+        Default sniffs the two shapes we already speak (Anthropic, then
+        OpenAI). **Override this for any backend that reports neither.**
+        Gemini's ``usageMetadata.promptTokenCount``, Ollama's native
+        ``prompt_eval_count``, and Cohere's ``meta.billed_units`` all fall
+        through the default and yield ``{}`` — which reads downstream as
+        "this turn was free", so a per-session token cap would never fire
+        and the response telemetry would log zeros forever with nothing
+        indicating the numbers are missing rather than genuinely zero.
+        """
+        norm = _normalize_anthropic_usage(usage)
+        if norm.get("total_tokens"):
+            return norm
+        return _normalize_openai_usage(usage)
+
+    def _capture_usage(self, payload: dict, request: LLMRequest) -> None:
+        """Pull token counts out of a response payload into request.usage.
+
+        Override only if the counts live somewhere other than a top-level
+        ``usage`` object (Codex OAuth's arrive inside an SSE
+        response.completed event). To change the *shape* mapping, override
+        :meth:`_normalize_usage` instead.
         """
         usage = payload.get("usage")
         if not isinstance(usage, dict):
             return
-        # Try Anthropic first (input_tokens/output_tokens with optional
-        # cache_*). If that yields no keys, fall back to OpenAI shape.
-        norm = _normalize_anthropic_usage(usage)
-        if norm.get("total_tokens"):
-            request.usage.update(norm)
-            return
-        norm = _normalize_openai_usage(usage)
+        norm = self._normalize_usage(usage)
         if norm:
             request.usage.update(norm)

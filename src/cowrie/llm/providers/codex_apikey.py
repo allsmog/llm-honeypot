@@ -60,9 +60,7 @@ class CodexAPIKeyProvider(LLMProvider):
         # breakpoints (its automatic prompt caching kicks in at >=1024
         # tokens regardless), so concatenate any system_blocks back
         # into a single system message.
-        system_text = request.system
-        if request.system_blocks:
-            system_text = "\n\n".join(t for t, _ in request.system_blocks if t)
+        system_text = request.system_text()
         messages: list[dict[str, str]] = []
         if system_text:
             messages.append({"role": "system", "content": system_text})
