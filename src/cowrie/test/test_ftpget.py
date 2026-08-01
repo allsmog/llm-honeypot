@@ -57,6 +57,17 @@ class ShellFtpGetCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tr.clear()
 
+    def tearDown(self) -> None:
+        # These tests schedule reactor.callLater work and return a Deferred.
+        # trial awaits it, but `python -m unittest discover` ignores the
+        # Deferred and leaves the delayed calls pending, which trial's
+        # reactor-cleanliness check then blames on the *next* test. Cancel
+        # any still-pending calls so the reactor stays clean under both
+        # runners (under trial the check() already fired before tearDown).
+        for call in reactor.getDelayedCalls():
+            if call.active():
+                call.cancel()
+
     def test_help_command(self) -> defer.Deferred[None]:
         usage = (
             b"BusyBox v1.20.2 (2016-06-22 15:12:53 EDT) multi-call binary.\n"
@@ -183,6 +194,17 @@ class ShellFtpGetAsyncTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tr.clear()
+
+    def tearDown(self) -> None:
+        # These tests schedule reactor.callLater work and return a Deferred.
+        # trial awaits it, but `python -m unittest discover` ignores the
+        # Deferred and leaves the delayed calls pending, which trial's
+        # reactor-cleanliness check then blames on the *next* test. Cancel
+        # any still-pending calls so the reactor stays clean under both
+        # runners (under trial the check() already fired before tearDown).
+        for call in reactor.getDelayedCalls():
+            if call.active():
+                call.cancel()
 
     def test_successful_download_anonymous(self) -> defer.Deferred[None]:
         """Test successful FTP download with anonymous login"""

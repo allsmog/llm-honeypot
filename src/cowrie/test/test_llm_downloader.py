@@ -160,6 +160,7 @@ class TestFetchDispatch(unittest.TestCase):
 
     def test_tftp_url_blocked_yields_failed_blocked(self):
         from twisted.internet import defer as _defer
+
         from cowrie.llm import downloader as dl
         events: list[dict] = []
         intent = dl.DownloadIntent(
@@ -177,6 +178,7 @@ class TestFetchDispatch(unittest.TestCase):
 
     def test_ftp_url_blocked_yields_failed_blocked(self):
         from twisted.internet import defer as _defer
+
         from cowrie.llm import downloader as dl
         events: list[dict] = []
         intent = dl.DownloadIntent(

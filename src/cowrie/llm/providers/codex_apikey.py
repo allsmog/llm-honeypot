@@ -78,7 +78,7 @@ class CodexAPIKeyProvider(LLMProvider):
         choices = payload.get("choices") or []
         if not choices:
             return ""
-        return choices[0].get("message", {}).get("content", "")
+        return str(choices[0].get("message", {}).get("content", ""))
 
     @classmethod
     def validate_config(cls, config) -> list[str]:

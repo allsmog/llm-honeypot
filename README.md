@@ -123,10 +123,49 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## What the fork adds beyond the provider abstraction
 
+- **Deterministic responder for identity/info commands.** The single
+  biggest believability win. `whoami`, `id`, `groups`, `hostname`, `uname`
+  (all flag forms), `arch`, `nproc`, `uptime`, `free`, `lscpu`, `ps`
+  (`aux`/`-ef`/bare), `top -bn1`, `vmstat`, `ping -c N`, `df`/`df -h`,
+  `mount`, `ss`/`netstat` (listening), `crontab -l`, `env`/`printenv`,
+  `echo` (with `$VAR` expansion), `which`/`command -v`, `date`, `w`, and
+  `cat` of `/etc/os-release`, `/etc/passwd`, `/etc/group`, `/etc/shadow`,
+  `/etc/crontab`, `/proc/cpuinfo`, `/proc/meminfo` (full 54-field render),
+  `/proc/mounts`, `/proc/loadavg`, `/etc/hostname`, … are rendered locally
+  from the pinned persona + per-session WorldState in
+  `cowrie/llm/responder.py` — never the model. This closes three honeypot
+  fingerprints at once that the 2025 SoK on honeypots+LLMs calls out:
+  **timing** (microsecond response with jitter, instead of the ~300–500ms
+  model round-trip a scanner can time), **consistency** (the same facts
+  every turn, derived from the same persona the LLM sees — `id www-data`
+  and `cat /etc/passwd` always agree on uid 33; `nproc` matches the
+  `/proc/cpuinfo` block count), and **cost** (zero API calls for the most
+  common probe commands). Anything unrecognized — and any file the session
+  has actually modified — falls through to the LLM unchanged. Toggle with
+  `[llm] deterministic_responses` (default on).
+- **Hardened system prompt.** `cowrie/llm/prompts.py` replaces the old
+  two-sentence "simulate a Linux server" default with an explicit
+  behavioral contract: output discipline (stdout/stderr bytes only, no
+  markdown/preamble/prompt-echo), error fidelity (real `command not found`
+  / `No such file or directory` / `Permission denied` wording),
+  ground-truth consistency against the pinned facts + WorldState,
+  never-break-character under social-engineering, and realistic handling
+  of full-screen/continuous programs (`top`, `vim`, `tail -f`). Overridable
+  via `[llm] system_prompt` / `system_prompt_exec`.
+- **Effective-user tracking (su/sudo).** `su`, `su - user`, `sudo -i`,
+  `sudo su -`, `sudo -u user …` push an effective-user stack in WorldState.
+  `whoami`/`id` and the shell prompt (including the `$`→`#` sigil) reflect
+  the top of the stack, and `exit` pops back to the parent shell instead of
+  closing the connection — a detail real shells get right and most
+  honeypots don't.
+- **Background-process tracking.** `cmd &` / `nohup cmd &` registers a PID
+  in WorldState; `ps` reflects launched payloads and the LLM prompt carries
+  them so narration stays consistent across turns.
 - **Fastpath for trivial commands.** `exit`/`logout`/`quit`, `cd`, `pwd`,
   `clear`, and empty input are handled in `lineReceived` without an LLM
-  round-trip. `exit` actually exits, `cd` updates `self.cwd` so the next
-  LLM turn sees consistent state. Cuts per-session latency and cost.
+  round-trip. `exit` actually exits (or pops an su subshell), `cd` updates
+  `self.cwd` so the next LLM turn sees consistent state. Cuts per-session
+  latency and cost.
 - **LLM-turn logging.** Every command emits `cowrie.llm.prompt` and
   `cowrie.llm.response` events to the JSON log with `latency_ms`. Errors
   log `cowrie.llm.error`. All carry the session id so they correlate with
@@ -148,15 +187,17 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
   Distro, kernel, /proc/cpuinfo model, memtotal, uptime range, package
   list all pinned in the system prompt — `uname -a`, `cat /etc/os-release`,
   `uptime`, `free`, `/proc/cpuinfo` stay consistent across turns.
-- **Real payload capture.** `wget`/`curl` are intercepted before the
-  LLM; the actual file is fetched via `treq`, persisted under
-  `[honeypot] download_path` with a SHA-256 filename, and logged as
-  `cowrie.session.file_download` (same event shape as upstream's shell
-  backend). SSRF is gated by `cowrie.core.network.communication_allowed`
-  — AWS/GCP metadata (169.254.169.254), RFC1918, loopback all blocked.
-  A `[SHELL_OBSERVED]` block carrying the real bytes/sha/url/status is
-  injected into the next LLM turn so its narration matches reality.
-  `tftp` / `ftpget` are parsed and their URLs logged but not yet fetched.
+- **Real payload capture.** `wget`/`curl`/`tftp`/`ftpget` are intercepted
+  before the LLM and the actual bytes are fetched — HTTP/HTTPS via `treq`,
+  TFTP via the RFC 1350 client, FTP via Twisted's `FTPClient` — then
+  persisted under `[honeypot] download_path` with a SHA-256 filename and
+  logged as `cowrie.session.file_download` (same event shape as upstream's
+  shell backend). SSRF is gated by
+  `cowrie.core.network.communication_allowed` — AWS/GCP metadata
+  (169.254.169.254), RFC1918, loopback all blocked. A `[SHELL_OBSERVED]`
+  block carrying the real bytes/sha/url/status is injected into the next
+  LLM turn so its narration matches reality. `scp` is intent-only
+  (refused-by-default; see Known limitations).
 - **Per-session WorldState.** Files actually downloaded persist into a
   WorldState object that flows into the system prompt's mutable-tail
   segment. Multi-turn consistency: `curl -o /tmp/x ...` then `ls /tmp`
@@ -172,24 +213,64 @@ That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
 
 ## Test coverage
 
-108 trial tests across 9 files under `src/cowrie/test/test_llm_*.py`,
-all green (2 skipped on optional deps). Logic-module coverage:
+253 trial tests across 12 files under `src/cowrie/test/test_llm_*.py`,
+all green (2 skipped on optional deps). The deterministic responder,
+persona, WorldState, command parser, prompt contract, and fidelity
+harness are heavily covered; `test_llm_responder.py` alone has 96 cases
+asserting per-distro file behavior, cross-command consistency (`id` vs
+`/etc/passwd`, `nproc` vs `/proc/cpuinfo`, `mount` vs `df` vs
+`/proc/mounts`, `ss` vs `netstat`), batch/interactive handling
+(`top -bn1`, `ping -c N`), the su/sudo effective-user flow, and graceful
+deferral of anything not modeled.
 
 | Module | Coverage |
 |---|---|
 | `persona.py` | 100% |
-| `cmd_parser.py` | 97% |
-| `worldstate.py` | 93% |
+| `prompts.py` | 100% |
+| `worldstate.py` | 98% |
+| `cmd_parser.py` | 93% |
+| `responder.py` | 93% |
+| `fidelity.py` | 93% |
 | `providers/streaming.py` | 92% |
 | `providers/codex_apikey.py` | 90% |
 | `providers/anthropic_apikey.py` | 88% |
 | `providers/registry.py` | 88% |
+| `protocol.py` | 69% |
 | `providers/codex_oauth.py` | 65% |
-| `protocol.py` | 65% |
 | `downloader.py` | 61% |
 | `providers/anthropic_oauth.py` | 61% |
 | `providers/base.py` | 58% |
 | `llm.py` | 31% |
+
+## Fidelity evaluation
+
+`scripts/fidelity_eval.py` (logic in `cowrie/llm/fidelity.py`) scores the
+deterministic responder on the two believability axes the honeypot
+literature uses, and doubles as a CI regression gate:
+
+- **Consistency** — 19 cross-command / against-persona invariants that
+  must hold (`uname -r` ⊂ `uname -a`, `nproc` == `/proc/cpuinfo` block
+  count, `id www-data` == `/etc/passwd` uid 33, `hostname` ==
+  `/etc/hostname`, `free` total == `/proc/meminfo` MemTotal, `/proc/meminfo`
+  has a realistic field count, root device consistent across
+  `mount`/`/proc/mounts`/`df`, `sshd:22` consistent across `ss`/`netstat`,
+  `top -bn1` memory matches the persona, …). Pure — no network or host
+  needed. The CLI exits non-zero if any fail, so it slots straight into CI
+  (a `tox -e fidelity` env and a dedicated workflow job run it on every PR).
+- **Coverage** — what fraction of a 44-command recon corpus the
+  deterministic layer answers locally (currently 100% across all six
+  personas) vs. defers to the LLM.
+- **Reference** (`--reference local`, opt-in) — structural similarity of
+  the honeypot's output to the **real host shell** after masking volatile
+  tokens (hostnames, IPs, hashes, numbers, column widths). Only a hardcoded
+  allowlist of read-only commands is ever run on the host — never an
+  attacker payload. This is how the thin 12-line `/proc/meminfo` render was
+  caught and expanded to the full 54-field set (an attacker `wc -l` tell).
+
+```bash
+PYTHONPATH=src python scripts/fidelity_eval.py --all-personas
+PYTHONPATH=src python scripts/fidelity_eval.py --reference local
+```
 
 The Twisted glue files (`avatar.py`, `realm.py`, `server.py`,
 `session.py`, `telnet.py`) are at 0% in trial — they're integration
@@ -206,16 +287,33 @@ coverage report --include='*/cowrie/llm/*'
 
 ## Known limitations
 
-- **scp payload capture is intent-only.** The downloader detects scp
-  commands, parses src/dst + direction (inbound vs outbound), and
-  logs `cowrie.session.scp_attempt` with the parsed fields — useful
-  for threat intel on who's trying to stage payloads. The actual SCP
-  binary protocol receiver isn't implemented in v1 because it lives
-  below the LLM protocol layer (per-channel SSH dispatch) and requires
-  a deeper refactor. Outbound scp stays refused-by-default to avoid
-  becoming an unintentional credential tester. The LLM narrates the
-  attempt as "Permission denied (publickey,password)." — consistent
-  with how a real locked-down sshd would respond.
+- **scp upload capture (inbound).** `scp payload host:/path` runs
+  `scp -t /path` on a raw exec channel below the command layer;
+  `cowrie/llm/scp.py`'s `ScpSink` speaks that wire protocol — acking each
+  control/data step and capturing the real bytes into an `Artifact` with
+  the same `cowrie.session.file_download` event shape as the wget/curl
+  path (SHA-256, dest path, size cap). Outbound scp (`scp -f`, download
+  *from* us) stays refused-by-default to avoid becoming a file/credential
+  source. Residual: only the SCP exec-channel form is captured; a `scp`
+  *typed at the interactive shell* is still narrated as permission-denied
+  by the LLM (that path never carries the binary stream).
+- **Full-screen interactive programs are emulated, with residuals.**
+  `top`/`htop`, `vi`/`vim`, and `less`/`more` take over the terminal
+  (alternate screen + raw keystrokes via `cowrie/llm/interactive.py`): the
+  program paints a believable screen, `top` repaints on its refresh timer,
+  pagers/editors show the real file content (from the VFS/WorldState), and
+  each exits the way the attacker expects (`top`: q; `vi`: `:q`/`:q!`/
+  `:wq`/`ZZ`; `less`: q / space-at-end). **`vi` actually edits** — insert
+  mode (i/a/A/I/o/O), cursor movement (h/j/k/l/0/$), `x` delete, Enter/
+  Backspace — and a save (`:w`/`:wq`/`ZZ`) writes the buffer through to
+  WorldState, so a later `cat`/`ls`/`stat` of the file reflects exactly what
+  the attacker wrote (`vi /tmp/x` → type → `:wq` → `cat /tmp/x` returns it,
+  deterministically). Residuals: the editor models the common subset, not
+  all of vim (no `/` search, `dd`, visual mode); `nano`/`emacs`/`watch`
+  still defer to the LLM; `top`'s process list refreshes a frame rather than
+  live-sampling. A skilled human probing deep editor internals can still
+  tell; automated tooling and casual operators generally can't. Toggle with
+  `[llm] interactive_programs`.
 - **Streaming responses are off by default.** Anthropic providers
   support it (`[llm] stream = true`); enabling it makes responses
   drip to the terminal rather than appear in one block, which is

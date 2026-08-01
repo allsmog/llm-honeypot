@@ -88,9 +88,10 @@ def _capture_log() -> tuple[list[str], Any]:
         if "format" in event:
             try:
                 captured.append(event["format"] % event)
-                return
             except Exception:
                 pass
+            else:
+                return
         msg = event.get("message")
         if msg:
             captured.append(" ".join(str(m) for m in msg))

@@ -11,12 +11,11 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from twisted.internet import defer, protocol
 from twisted.python import failure as tw_failure
 from twisted.python import log
-
 
 OnChunk = Callable[[str], None]
 

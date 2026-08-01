@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2025-2026 Michel Oosterhof <michel@oosterhof.net>
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# This is a honeypot. Several files intentionally contain SYNTHETIC
+# credentials — bait an attacker is meant to find (a believable
+# /etc/shadow), canned test fixtures, and simulated attacker payloads.
+# None are real secrets; they're excluded from secret scanning here.
+version: 2
+
+secret:
+  ignored-paths:
+    # Unit-test fixtures use placeholder OAuth/API tokens.
+    - "src/cowrie/test/**"
+    # The local attacker simulator embeds synthetic payloads + a fake key.
+    - "scripts/attacker_sim.py"
+  ignored-matches:
+    # Deterministic /etc/shadow bait rendered by the responder (not real).
+    - name: synthetic honeypot /etc/shadow root hash
+      match: "$6$rounds=656000$abcdefgh$0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    - name: synthetic honeypot /etc/shadow user hash
+      match: "$6$xyz$Qm9zRzJhc2RmZ2hqa2x6eGN2Ym5tMTIzNDU2Nzg5MGFiY2RlZ"

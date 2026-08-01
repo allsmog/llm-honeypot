@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # ABOUTME: Real-payload capture for the LLM backend. When the attacker
-# ABOUTME: runs wget/curl/tftp/ftpget, we (a) parse the URL out of the
-# ABOUTME: command, (b) actually fetch it (HTTP/HTTPS) through Cowrie's
-# ABOUTME: SSRF gate, (c) persist via cowrie.core.artifact.Artifact, and
-# ABOUTME: (d) hand the LLM a [SHELL_OBSERVED] block so its narration
-# ABOUTME: matches reality. TFTP and FTP are detected but their bodies
-# ABOUTME: aren't fetched yet (Phase 4 follow-up); the intent + URL still
-# ABOUTME: lands in the threat-intel log.
+# ABOUTME: runs wget/curl (HTTP/HTTPS/FTP), tftp, or ftpget, we (a) parse
+# ABOUTME: the URL out of the command, (b) actually fetch the bytes through
+# ABOUTME: Cowrie's SSRF gate (real HTTP via treq, real TFTP via the RFC1350
+# ABOUTME: client, real FTP via Twisted's FTPClient), (c) persist via
+# ABOUTME: cowrie.core.artifact.Artifact, and (d) hand the LLM a
+# ABOUTME: [SHELL_OBSERVED] block so its narration matches reality. `scp`
+# ABOUTME: typed at the shell is narrated as permission-denied here; the
+# ABOUTME: real upload vector (`scp -t`, on a raw exec channel) is captured
+# ABOUTME: by cowrie.llm.scp.ScpSink, same file_download event shape.
 
 from __future__ import annotations
 
@@ -15,8 +17,8 @@ import re
 import shlex
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import treq
 from twisted.internet import defer
@@ -27,7 +29,6 @@ from cowrie.core.artifact import Artifact
 from cowrie.core.config import CowrieConfig
 from cowrie.core.network import communication_allowed
 
-
 # ----------------------------------------------------------------------
 # Intent parsing
 
@@ -36,12 +37,12 @@ from cowrie.core.network import communication_allowed
 class DownloadIntent:
     tool: str            # "wget" | "curl" | "tftp" | "ftpget"
     url: str             # full URL ("http://...", "ftp://...", "tftp://...")
-    outfile: Optional[str]  # destination as the attacker requested, or None
+    outfile: str | None  # destination as the attacker requested, or None
     raw_command: str
 
 
-# Tools whose first token signals a download. tftp/ftpget are recognized
-# but currently logged-only (no fetch). wget/curl drive real HTTP fetches.
+# Tools whose first token signals a download. wget/curl/tftp/ftpget all
+# drive real fetches (HTTP/FTP/TFTP); scp is intent-only (refused).
 _DOWNLOAD_TOOLS = {"wget", "curl", "tftp", "ftpget", "scp"}
 
 
@@ -61,7 +62,7 @@ def _split_pipeline(line: str) -> str:
     return line
 
 
-def parse_download_command(line: str) -> Optional[DownloadIntent]:
+def parse_download_command(line: str) -> DownloadIntent | None:
     """Detect a leading wget/curl/tftp/ftpget and extract the URL.
 
     Returns None for non-download commands (cheapest possible miss path,
@@ -100,7 +101,7 @@ def parse_download_command(line: str) -> Optional[DownloadIntent]:
     return None
 
 
-def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_scp(args: list[str], raw: str) -> DownloadIntent | None:
     """Detect `scp <src> <dst>`. Both directions caught.
 
     Direction is encoded in the URL string:
@@ -139,7 +140,7 @@ def _parse_scp(args: list[str], raw: str) -> Optional[DownloadIntent]:
     )
 
 
-def _parse_wget(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_wget(args: list[str], raw: str) -> DownloadIntent | None:
     # wget [-O outfile | -O- ] [opts...] URL [URL...]
     outfile = None
     urls: list[str] = []
@@ -169,7 +170,7 @@ def _parse_wget(args: list[str], raw: str) -> Optional[DownloadIntent]:
     return DownloadIntent(tool="wget", url=urls[0], outfile=outfile, raw_command=raw)
 
 
-def _parse_curl(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_curl(args: list[str], raw: str) -> DownloadIntent | None:
     # curl [-o outfile | -O] [opts...] URL
     outfile = None
     use_remote_name = False
@@ -205,7 +206,7 @@ def _parse_curl(args: list[str], raw: str) -> Optional[DownloadIntent]:
 _TFTP_GET_RE = re.compile(r"(?:^|\s)(?:-g\s+)?(?:-r\s+(\S+))(?:\s+-l\s+(\S+))?")
 
 
-def _parse_tftp(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_tftp(args: list[str], raw: str) -> DownloadIntent | None:
     # busybox tftp -g -r remote_file [-l local_file] host [port]
     remote = None
     local = None
@@ -234,7 +235,7 @@ def _parse_tftp(args: list[str], raw: str) -> Optional[DownloadIntent]:
     )
 
 
-def _parse_ftpget(args: list[str], raw: str) -> Optional[DownloadIntent]:
+def _parse_ftpget(args: list[str], raw: str) -> DownloadIntent | None:
     # busybox ftpget [-u user] [-p pass] host local remote
     user = None  # noqa: F841 — captured into URL below
     host = None
@@ -279,13 +280,13 @@ class FetchResult:
     outcome: str   # success | partial | failed_blocked | failed_dns
                    # | failed_connection | failed_http | tool_unsupported
     url: str
-    saved_to: Optional[str] = None
+    saved_to: str | None = None
     bytes_downloaded: int = 0
-    bytes_advertised: Optional[int] = None
-    sha256: Optional[str] = None
-    http_status: Optional[int] = None
-    content_type: Optional[str] = None
-    error_message: Optional[str] = None
+    bytes_advertised: int | None = None
+    sha256: str | None = None
+    http_status: int | None = None
+    content_type: str | None = None
+    error_message: str | None = None
     duration_seconds: float = 0.0
 
 
@@ -395,29 +396,6 @@ def _refuse_scp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     ))
 
 
-def _refuse_unimplemented(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
-    """Log the attempt but skip the actual fetch.
-
-    Threat intel still captures the URL via cowrie.session.file_download.failed;
-    the LLM narrates a connect timeout via the observation. When real
-    FTP/TFTP fetch is implemented (Phase 3 follow-up), this disappears.
-    """
-    log_event(
-        eventid="cowrie.session.file_download.failed",
-        url=intent.url,
-        outfile=intent.outfile,
-        format="Attempted %(eventid)s of %(url)s (LLM-honeypot does not "
-               "fetch this protocol yet)",
-    )
-    return defer.succeed(
-        FetchResult(
-            outcome="failed_connection",
-            url=intent.url,
-            error_message="Connection timed out",
-        )
-    )
-
-
 def _fetch_http(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     """Real treq-based fetch with the same SSRF + size-cap protections as
     cowrie.commands.wget. Persists via Artifact, logs identical event
@@ -497,7 +475,7 @@ def _do_treq_fetch(intent, log_event, url, size_cap, t0):
             ctype = ctype_h[0].decode("latin1", errors="replace")
         except Exception:
             pass
-        adv: Optional[int] = None
+        adv: int | None = None
         try:
             cl_h = resp.headers.getRawHeaders(b"content-length") or []
             if cl_h:
@@ -633,6 +611,7 @@ def _fetch_tftp(intent: DownloadIntent, *, log_event: LogEventFn) -> Deferred:
     """
     # Lazy-import to avoid pulling in HoneyPotCommand at module init.
     from twisted.internet import reactor
+
     from cowrie.commands.tftp import TFTPClient
 
     url = intent.url

@@ -184,7 +184,7 @@ class AnthropicOAuthProvider(LLMProvider):
         content = payload.get("content") or []
         for block in content:
             if block.get("type") == "text":
-                return block.get("text", "")
+                return str(block.get("text", ""))
         return ""
 
     def _supports_streaming(self) -> bool:

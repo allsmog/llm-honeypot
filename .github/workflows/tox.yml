@@ -87,6 +87,25 @@ jobs:
         run: python -m setuptools_scm --force-write-version-files
       - run: tox -e typing
 
+  fidelity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip -q install --upgrade pip setuptools setuptools-scm wheel
+          python -m pip -q install -e .
+          python -m pip -q install tox
+      - name: Generate version file
+        run: python -m setuptools_scm --force-write-version-files
+      - run: tox -e fidelity
+
   test:
     runs-on: ubuntu-latest
     env:

@@ -10,16 +10,72 @@ from twisted.trial import unittest
 from cowrie.llm.cmd_parser import parse_input_mutations
 
 
+class TestUserSwitch(unittest.TestCase):
+    def test_su_bare_is_root(self):
+        muts = parse_input_mutations("su")
+        self.assertEqual(len(muts), 1)
+        self.assertEqual(muts[0].kind, "push_user")
+        self.assertEqual(muts[0].user, "root")
+
+    def test_su_dash_is_root(self):
+        muts = parse_input_mutations("su -")
+        self.assertEqual(muts[0].user, "root")
+
+    def test_su_named_user(self):
+        muts = parse_input_mutations("su - postgres")
+        self.assertEqual(muts[0].kind, "push_user")
+        self.assertEqual(muts[0].user, "postgres")
+
+    def test_sudo_i_is_root(self):
+        muts = parse_input_mutations("sudo -i")
+        self.assertEqual(muts[0].user, "root")
+
+    def test_sudo_su_is_root(self):
+        muts = parse_input_mutations("sudo su -")
+        self.assertEqual(muts[0].user, "root")
+
+    def test_sudo_su_named(self):
+        muts = parse_input_mutations("sudo su - www-data")
+        self.assertEqual(muts[0].user, "www-data")
+
+    def test_sudo_normal_command_is_not_a_switch(self):
+        # `sudo cat /etc/shadow` is a one-shot elevation, not a shell.
+        muts = parse_input_mutations("sudo cat /etc/shadow")
+        self.assertEqual([m for m in muts if m.kind == "push_user"], [])
+
+
+class TestBackgroundProcess(unittest.TestCase):
+    def test_simple_background(self):
+        muts = parse_input_mutations("python3 miner.py &")
+        self.assertEqual(len(muts), 1)
+        self.assertEqual(muts[0].kind, "add_process")
+        self.assertEqual(muts[0].proc_command, "python3 miner.py")
+
+    def test_nohup_stripped(self):
+        muts = parse_input_mutations("nohup ./payload &")
+        self.assertEqual(muts[0].kind, "add_process")
+        self.assertEqual(muts[0].proc_command, "./payload")
+
+    def test_double_amp_then_background(self):
+        # The trailing single & still backgrounds the whole line.
+        muts = parse_input_mutations("make && make install &")
+        self.assertEqual(muts[0].kind, "add_process")
+
+    def test_no_trailing_amp_no_process(self):
+        muts = parse_input_mutations("python3 miner.py")
+        self.assertEqual([m for m in muts if m.kind == "add_process"], [])
+
+
 class TestEchoRedirect(unittest.TestCase):
     def test_echo_overwrite(self):
-        muts = parse_input_mutations('echo hello > /tmp/x')
+        muts = parse_input_mutations("echo hello > /tmp/x")
         self.assertEqual(len(muts), 1)
         self.assertEqual(muts[0].kind, "create_file")
         self.assertEqual(muts[0].path, "/tmp/x")
         self.assertEqual(muts[0].content, "hello")
 
     def test_echo_append(self):
-        muts = parse_input_mutations('echo line2 >> /tmp/x')
+        muts = parse_input_mutations("echo line2 >> /tmp/x")
         self.assertEqual(muts[0].kind, "append_file")
         self.assertEqual(muts[0].content, "line2")
 

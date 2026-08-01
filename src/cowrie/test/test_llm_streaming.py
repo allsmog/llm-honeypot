@@ -52,7 +52,7 @@ class TestStreamingBodyConsumer(unittest.TestCase):
 
     def test_ignores_non_data_lines(self):
         chunks: list[str] = []
-        consumer, completion = make_streaming_consumer(200, chunks.append)
+        consumer, _completion = make_streaming_consumer(200, chunks.append)
         consumer.dataReceived(
             b'event: ping\n\n'
             b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n\n'
@@ -62,7 +62,7 @@ class TestStreamingBodyConsumer(unittest.TestCase):
 
     def test_malformed_json_in_data_line_is_skipped(self):
         chunks: list[str] = []
-        consumer, completion = make_streaming_consumer(200, chunks.append)
+        consumer, _completion = make_streaming_consumer(200, chunks.append)
         consumer.dataReceived(
             b'data: {invalid json}\n\n'
             b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}\n\n'
