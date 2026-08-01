@@ -47,42 +47,74 @@ _DECOY_RELEVANT = frozenset(
 #: runtime would refuse.
 UNSAFE_SIGNALS_FOR_TERMINATE = 2
 
+#: At or above this many unsafe signals, stop volunteering new material.
+#:
+#: `unsafe_events` counts things *we* did wrong — an SSRF-gate block, a
+#: credential-shaped string in our own output, an observation leak — and is
+#: supplied by the runtime at the root; no transition increments it. That
+#: makes it constant within a single search, so as a utility term it cannot
+#: change which policy wins. This legality gate is where it actually bites:
+#: a session that has already leaked something stops being allowed to plant
+#: decoys. It is also the guard against the planner learning to bait
+#: dangerous behaviour now that attacker tool-abuse counts as a gain.
+UNSAFE_SIGNALS_FOR_DISCLOSURE_HALT = 1
 
-def _interior_ok(state: GameState, policy: DefenderPolicy) -> bool:
-    """Table-driven legality for a node with no concrete command.
 
-    Interior nodes cannot probe the real subsystems — MIN played an
-    abstract category, there is no command string to hand to
-    responder.respond(). So interior legality is a pure function of state.
-    The root additionally intersects this with runtime probe results.
+def _state_ok(state: GameState, policy: DefenderPolicy) -> bool:
+    """Constraints the *runtime cannot know* — budgets and safety gates.
+
+    Applied at every node, root included, because the protocol seam's
+    legality probe answers "can this component render this command?" and
+    has no view of the token budget or accumulated safety signals.
     """
-    last = state.last_attack
-
     if policy is P.DELAY_PRESSURE:
         # Unconditionally legal. This is load-bearing: it guarantees the
         # legal set is never empty for a non-terminal state, which is what
         # keeps a +/-inf sentinel from escaping as a node value.
         return True
 
-    if policy is P.DOWNLOADER_INTERCEPT:
-        return last is A.PAYLOAD_TRANSFER
-
     if policy is P.TERMINATE_SESSION:
-        return last is A.EXIT or state.unsafe_events >= UNSAFE_SIGNALS_FOR_TERMINATE
-
-    if policy is P.PERSONA_LLM:
-        return _tokens_available(state)
+        return (
+            state.last_attack is A.EXIT
+            or state.unsafe_events >= UNSAFE_SIGNALS_FOR_TERMINATE
+        )
 
     if policy is P.DECOY_DISCLOSURE:
-        return _tokens_available(state) and last in _DECOY_RELEVANT
+        if state.unsafe_events >= UNSAFE_SIGNALS_FOR_DISCLOSURE_HALT:
+            return False
+        return _tokens_available(state)
 
+    if policy in (P.PERSONA_LLM, P.DOWNLOADER_INTERCEPT):
+        return _tokens_available(state)
+
+    return True
+
+
+def _shape_ok(state: GameState, policy: DefenderPolicy) -> bool:
+    """Proxy for "could this component render the command?", by category.
+
+    Interior nodes have no command string — MIN played an abstract
+    category, and there is nothing to hand to responder.respond(). So away
+    from the root we approximate availability from the attacker's action
+    class.
+
+    This is only ever a *proxy*, and at the root it must not be consulted:
+    there we have the real command and the real probe result. Intersecting
+    the runtime mask with this table used to strip DETERMINISTIC from
+    `crontab -l` — the emulator answers it perfectly, but the command
+    classifies as PERSISTENCE_ATTEMPT, which is not in the answerable set.
+    """
+    last = state.last_attack
+
+    if policy is P.DOWNLOADER_INTERCEPT:
+        return last is A.PAYLOAD_TRANSFER
+    if policy is P.DECOY_DISCLOSURE:
+        return last in _DECOY_RELEVANT
     if policy is P.DETERMINISTIC:
         return last in _DETERMINISTIC_ANSWERABLE
-
     if policy in (P.PLAUSIBLE_FAILURE, P.PERMISSION_DENIAL):
         # A refusal only makes sense in response to an attempt.
         return last is not A.EXIT
-
     return True
 
 
@@ -100,18 +132,27 @@ def legal_defender_policies(
     ``allowed`` is the runtime mask from PolicyLegality at the root; None
     at interior nodes.
 
-    Guaranteed non-empty for any non-terminal state. If the mask and the
-    table disagree completely we fall back to DELAY_PRESSURE rather than
-    returning (), because an empty move set makes the max loop return its
-    -inf seed as a real node value — and both search implementations would
-    do that identically, so the equivalence test would pass while the
+    At the root the mask is *authoritative* about which components can
+    render the command, because it was built by actually calling them. It
+    is intersected only with the state constraints the runtime cannot see
+    (token budget, safety gates) — never with the category proxy in
+    _shape_ok, which exists solely for nodes that have no command text.
+
+    Guaranteed non-empty for any non-terminal state: if the mask and the
+    state constraints leave nothing, we fall back to DELAY_PRESSURE rather
+    than returning (), because an empty move set makes the max loop return
+    its -inf seed as a real node value — and both search implementations
+    would do that identically, so the equivalence test would pass while the
     planner is corrupt.
     """
     if state.terminated:
         return ()
-    moves = [p for p in DefenderPolicy if _interior_ok(state, p)]
     if allowed is not None:
-        moves = [p for p in moves if p in allowed]
+        moves = [p for p in DefenderPolicy if p in allowed and _state_ok(state, p)]
+    else:
+        moves = [
+            p for p in DefenderPolicy if _state_ok(state, p) and _shape_ok(state, p)
+        ]
     if not moves:
         moves = [P.DELAY_PRESSURE]
     return tuple(moves)
@@ -164,8 +205,41 @@ def _repetition_penalty(state: GameState, policy: DefenderPolicy) -> float:
     return 0.02 * state.policy_count_of(policy)
 
 
+def _engage(engagement: float, k: float) -> float:
+    """Move engagement toward 1.0 by a fraction of the remaining headroom.
+
+    Deliberately not `min(1.0, e + k)`. A hard cap means that once a
+    session is going well every engaging policy scores identically on this
+    term, the search can no longer tell them apart, and whichever policy is
+    cheapest wins by default. Diminishing returns keep the ordering strict
+    at every level while staying inside (0, 1).
+    """
+    return engagement + (1.0 - engagement) * k
+
+
+def _disengage(engagement: float, k: float) -> float:
+    """Mirror of _engage: proportional loss, never below 0."""
+    return engagement - engagement * k
+
+
 def apply_defender(state: GameState, policy: DefenderPolicy) -> GameState:
-    """MAX moves. Returns a new state; ``state`` is never mutated."""
+    """MAX moves. Returns a new state; ``state`` is never mutated.
+
+    NOTE ON INTEL: no defender policy grants intel_value. Intelligence is
+    generated by what the *attacker* chose to do — their command is what
+    reveals their capability and intent — not by which of our components
+    rendered the reply. An earlier version credited DETERMINISTIC +0.05 and
+    PERSONA_LLM +0.20, which asserts the model is four times more
+    informative about the attacker than the emulator is. For any command
+    both can answer that is simply false: the observable output is the
+    same, and the LLM version is merely slower, costs tokens, and can
+    contradict itself later. That mis-attribution made PERSONA_LLM beat
+    DETERMINISTIC on every command, including `whoami`.
+
+    So policies are separated only by what they genuinely differ on: cost,
+    the attacker's willingness to keep going, fingerprint exposure,
+    consistency risk, and what they capture.
+    """
     s = state.with_policy(policy)
     last = state.last_attack
     fp = _repetition_penalty(state, policy)
@@ -175,19 +249,23 @@ def apply_defender(state: GameState, policy: DefenderPolicy) -> GameState:
         # consistency debt rather than adding to it.
         s = replace(
             s,
-            intel_value=s.intel_value + 0.05,
+            engagement=_engage(s.engagement, 0.06),
             consistency_debt=max(0.0, s.consistency_debt - 0.05),
+            # HEURISTIC: a microsecond reply is slightly *too* instant, but
+            # _show_prompt's jitter already covers most of that, so the
+            # residual risk is small. Real bash answers in 1-10ms, which is
+            # what this path most closely resembles.
             fingerprint_exposure=s.fingerprint_exposure
             + fp
-            # HEURISTIC: a deterministic answer returns in microseconds. To
-            # a timing probe that is *too* fast to be a real command.
-            + (0.06 if last is A.TIMING_PROBE else 0.0),
+            + (0.02 if last is A.TIMING_PROBE else 0.0),
         )
 
     elif policy is P.PLAUSIBLE_FAILURE:
         s = replace(
             s,
-            engagement=s.engagement - 0.05,
+            engagement=_disengage(s.engagement, 0.10),
+            # A refusal still tells us what they were reaching for.
+            ttp_value=s.ttp_value + 0.05,
             fingerprint_exposure=s.fingerprint_exposure + 0.02 + fp,
         )
 
@@ -197,23 +275,26 @@ def apply_defender(state: GameState, policy: DefenderPolicy) -> GameState:
         expected = last is A.USER_PRIV_DISCOVERY
         s = replace(
             s,
-            engagement=s.engagement - 0.08,
-            ttp_value=s.ttp_value + (0.1 if expected else 0.0),
+            engagement=_disengage(s.engagement, 0.12),
+            ttp_value=s.ttp_value + (0.10 if expected else 0.05),
             fingerprint_exposure=s.fingerprint_exposure
             + (0.0 if expected else 0.04)
             + fp,
         )
 
     elif policy is P.DELAY_PRESSURE:
-        # Masks the LLM's latency signature when someone is timing us.
-        masks = last is A.TIMING_PROBE
+        # Not a specialist for timing probes — a *fallback*. Stalling does
+        # not mask the model's latency; it substitutes a third, equally
+        # unnatural timing. Its real use is when nothing else is available:
+        # the token budget is gone and the emulator cannot answer. On an
+        # ordinary command it answers nothing at all, and a box that
+        # randomly freezes is its own tell, so it is priced to lose
+        # whenever a real answer is on the table.
         s = replace(
             s,
             latency_cost=s.latency_cost + 0.15,
-            engagement=s.engagement - 0.04,
-            fingerprint_exposure=max(
-                0.0, s.fingerprint_exposure + (-0.05 if masks else 0.0) + fp
-            ),
+            engagement=_disengage(s.engagement, 0.20),
+            fingerprint_exposure=s.fingerprint_exposure + 0.06 + fp,
         )
 
     elif policy is P.PERSONA_LLM:
@@ -228,19 +309,23 @@ def apply_defender(state: GameState, policy: DefenderPolicy) -> GameState:
         s = replace(
             s,
             tokens_spent=s.tokens_spent + cost,
-            intel_value=s.intel_value + 0.20,
-            engagement=s.engagement + 0.10,
+            engagement=_engage(s.engagement, 0.06),
             consistency_debt=s.consistency_debt + debt,
             n_obligations_llm=s.n_obligations_llm + 1,
-            fingerprint_exposure=s.fingerprint_exposure + fp,
+            # HEURISTIC: the model round-trip takes 500-2000ms where real
+            # bash takes 1-10ms. cowrie.cfg.dist calls this out as the
+            # fork's headline timing tell, and it is exactly what someone
+            # running a timing probe is measuring.
+            fingerprint_exposure=s.fingerprint_exposure
+            + fp
+            + (0.08 if last is A.TIMING_PROBE else 0.0),
         )
 
     elif policy is P.DECOY_DISCLOSURE:
         s = replace(
             s,
             tokens_spent=s.tokens_spent + _llm_cost(s),
-            intel_value=s.intel_value + 0.15,
-            engagement=s.engagement + 0.12,
+            engagement=_engage(s.engagement, 0.20),
             ttp_value=s.ttp_value + 0.2,
             n_obligations_world=s.n_obligations_world + 1,
             # HEURISTIC: a second convenient discovery starts to smell.
@@ -254,8 +339,8 @@ def apply_defender(state: GameState, policy: DefenderPolicy) -> GameState:
             s,
             tokens_spent=s.tokens_spent + _llm_cost(s),
             payloads_captured=s.payloads_captured + 1,
-            intel_value=s.intel_value + 0.4,
             ttp_value=s.ttp_value + 0.4,
+            engagement=_engage(s.engagement, 0.05),
             fingerprint_exposure=s.fingerprint_exposure + fp,
         )
 
@@ -359,15 +444,23 @@ def apply_attacker(state: GameState, action: AttackerAction) -> GameState:
         )
 
     elif action in (A.TOOL_ABUSE, A.PERSISTENCE_ATTEMPT):
-        # Safety cost is charged to the defender line that permitted it —
-        # that is what makes the unsafe_behavior weight actually steer
-        # policy rather than being a constant everyone pays.
-        permitted = prev in (P.PERSONA_LLM, P.DECOY_DISCLOSURE)
+        # An attacker deploying a miner or installing an authorized_keys
+        # entry is the single most valuable thing that can happen here: it
+        # is exactly the intelligence a honeypot exists to collect. Credit
+        # it.
+        #
+        # A previous version charged this to whichever policy "permitted"
+        # it — meaning an LLM reply was blamed for the attacker's next
+        # command. That was both causally wrong (they run `chmod +x`
+        # regardless of how we narrated the previous line) and
+        # catastrophic in practice: at weight 10.0 the penalty exceeded
+        # every possible gain, so MIN played tool abuse after every LLM
+        # reply and PERSONA_LLM became unselectable. See
+        # scripts/planner_diff.py.
         s = replace(
             s,
-            intel_value=s.intel_value + 0.2 * novelty,
-            ttp_value=s.ttp_value + 0.3,
-            unsafe_events=s.unsafe_events + (1 if permitted else 0),
+            intel_value=s.intel_value + 0.3 * novelty,
+            ttp_value=s.ttp_value + 0.4,
         )
 
     else:

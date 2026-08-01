@@ -3,14 +3,21 @@
 """Unit tests for the planner's move generation, transitions and scoring.
 
 These pin *structure and sign*: that a policy is legal only when it makes
-sense, that spending tokens increases spend, that masking a timing probe
-lowers exposure rather than raising it.
+sense, that spending tokens increases spend, that the slow model path is
+more exposed under a timing probe than the fast local one.
 
 They deliberately do NOT pin the magnitudes in transition.py's effect
 tables. Those numbers are hand-tuned guesses that we expect to retune as
 the planner meets real traffic; a test asserting `fingerprint == 0.06`
 would just be a second copy of the constant, and would turn every honest
 retune into a red build.
+
+Limits worth knowing: everything here checks one effect in isolation, and
+a full suite of these stayed green through two tunings that each left a
+single policy winning nearly every real decision. Sign-per-effect cannot
+see domination. That is what scripts/planner_diff.py is for, and the
+classes below marked with a reference to it exist because it caught
+something these tests could not.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from cowrie.llm.planner.actions import (
     DefenderPolicy,
 )
 from cowrie.llm.planner.evaluate import components_from, evaluate
+from cowrie.llm.planner.search import plan
 from cowrie.llm.planner.state import HISTORY_WINDOW, GameState, UtilityWeights
 from cowrie.llm.planner.transition import (
     CONTRADICTION_THRESHOLD,
@@ -130,14 +138,41 @@ class TestDefenderLegality(unittest.TestCase):
         alarmed = replace(calm, unsafe_events=2)
         self.assertIn(P.TERMINATE_SESSION, legal_defender_policies(alarmed))
 
-    def test_mask_narrows_but_never_empties(self):
+    def test_mask_narrows_the_move_set(self):
         s = state_after(A.OS_FINGERPRINT)
-        only_llm = legal_defender_policies(s, allowed=frozenset({P.PERSONA_LLM}))
-        self.assertEqual(only_llm, (P.PERSONA_LLM,))
-        impossible = legal_defender_policies(
-            s, allowed=frozenset({P.DOWNLOADER_INTERCEPT})
+        self.assertEqual(
+            legal_defender_policies(s, allowed=frozenset({P.PERSONA_LLM})),
+            (P.PERSONA_LLM,),
         )
-        self.assertEqual(impossible, (P.DELAY_PRESSURE,))
+
+    def test_root_mask_is_authoritative_over_the_category_proxy(self):
+        """At the root we know the real command, so the runtime probe wins.
+
+        Regression: `crontab -l` classifies as PERSISTENCE_ATTEMPT, which is
+        not in the deterministic-answerable category set — but the emulator
+        answers it perfectly. Intersecting the runtime mask with the
+        category proxy stripped DETERMINISTIC and sent it to the LLM.
+        """
+        s = state_after(A.PERSISTENCE_ATTEMPT)
+        self.assertNotIn(P.DETERMINISTIC, legal_defender_policies(s))  # interior proxy
+        self.assertIn(
+            P.DETERMINISTIC,
+            legal_defender_policies(s, allowed=frozenset({P.DETERMINISTIC})),
+        )
+
+    def test_state_constraints_still_apply_at_the_root(self):
+        """The mask says what a component *can render*; it has no view of
+        the token budget."""
+        broke = state_after(
+            A.OS_FINGERPRINT,
+            tokens_budget=1000,
+            tokens_spent=900,
+            est_tokens_per_llm_turn=500,
+        )
+        self.assertEqual(
+            legal_defender_policies(broke, allowed=frozenset({P.PERSONA_LLM})),
+            (P.DELAY_PRESSURE,),
+        )
 
 
 class TestAttackerLegality(unittest.TestCase):
@@ -187,11 +222,29 @@ class TestDefenderEffects(unittest.TestCase):
             apply_defender(s, P.PERSONA_LLM).consistency_debt, s.consistency_debt
         )
 
-    def test_delay_masks_a_timing_probe(self):
+    def test_the_model_round_trip_is_the_timing_tell(self):
+        """Real bash answers in 1-10ms; the LLM path takes 500-2000ms.
+
+        cowrie.cfg.dist names that as the fork's headline timing signature,
+        and it is precisely what a timing probe measures. So the local
+        answer must be the *least* exposed option under one, not the most.
+        """
         s = state_after(A.TIMING_PROBE)
-        delayed = apply_defender(s, P.DELAY_PRESSURE)
-        instant = apply_defender(s, P.DETERMINISTIC)
-        self.assertLess(delayed.fingerprint_exposure, instant.fingerprint_exposure)
+        local = apply_defender(s, P.DETERMINISTIC).fingerprint_exposure
+        model = apply_defender(s, P.PERSONA_LLM).fingerprint_exposure
+        stalling = apply_defender(s, P.DELAY_PRESSURE).fingerprint_exposure
+        self.assertLess(local, model)
+        self.assertLess(local, stalling)
+
+    def test_delay_answers_nothing_so_it_costs_engagement(self):
+        """DELAY is a fallback, not a specialist. Stalling does not mask
+        the model's latency — it substitutes a third unnatural timing —
+        and on an ordinary command it emits no answer at all."""
+        s = state_after(A.FS_CONSISTENCY_PROBE)
+        stalled = apply_defender(s, P.DELAY_PRESSURE)
+        answered = apply_defender(s, P.DETERMINISTIC)
+        self.assertLess(stalled.engagement, answered.engagement)
+        self.assertGreater(stalled.fingerprint_exposure, answered.fingerprint_exposure)
 
     def test_denial_is_expected_when_probing_privilege(self):
         probing = state_after(A.USER_PRIV_DISCOVERY)
@@ -228,6 +281,66 @@ class TestDefenderEffects(unittest.TestCase):
     def test_terminate_sets_the_flag(self):
         s = state_after(A.EXIT)
         self.assertTrue(apply_defender(s, P.TERMINATE_SESSION).terminated)
+
+
+class TestIntelAttribution(unittest.TestCase):
+    """Intelligence comes from what the attacker did, not from who answered.
+
+    These pin the correction that scripts/planner_diff.py forced. Crediting
+    PERSONA_LLM +0.20 intel against DETERMINISTIC's +0.05 asserted the model
+    is four times more informative *about the attacker* than the emulator
+    is. For any command both can answer that is false — the observable
+    output is the same — and it made the LLM beat the free, instant,
+    provably-consistent local answer on every command including `whoami`.
+    """
+
+    def test_no_defender_policy_grants_intel(self):
+        s = state_after(A.OS_FINGERPRINT)
+        for policy in DefenderPolicy:
+            self.assertEqual(
+                apply_defender(s, policy).intel_value,
+                s.intel_value,
+                f"{policy} invented intelligence",
+            )
+
+    def test_attacker_actions_do_grant_intel(self):
+        s = state_after(A.OS_FINGERPRINT)
+        for action in ATTACKER_MOVES:
+            if action is A.EXIT:
+                continue
+            self.assertGreater(apply_attacker(s, action).intel_value, s.intel_value)
+
+    def test_free_local_answer_beats_the_model_when_both_can_answer(self):
+        """The whole point of the correction: same information, no tokens,
+        no contradiction risk."""
+        s = state_after(A.OS_FINGERPRINT)
+        both = frozenset({P.DETERMINISTIC, P.PERSONA_LLM})
+        self.assertIs(plan(s, depth=4, allowed=both).best_policy, P.DETERMINISTIC)
+
+    def test_model_is_chosen_when_the_emulator_cannot_answer(self):
+        s = state_after(A.OS_FINGERPRINT)
+        only = frozenset({P.PERSONA_LLM, P.DELAY_PRESSURE})
+        self.assertIs(plan(s, depth=4, allowed=only).best_policy, P.PERSONA_LLM)
+
+
+class TestSafetyBrake(unittest.TestCase):
+    """unsafe_events is runtime-supplied and bites through legality.
+
+    Because no transition increments it, it is constant inside any one
+    search and therefore cannot change which policy wins on utility alone.
+    The legality gate is where it actually does something.
+    """
+
+    def test_a_prior_safety_signal_stops_us_volunteering_decoys(self):
+        clean = state_after(A.FS_CONSISTENCY_PROBE)
+        burned = replace(clean, unsafe_events=1)
+        self.assertIn(P.DECOY_DISCLOSURE, legal_defender_policies(clean))
+        self.assertNotIn(P.DECOY_DISCLOSURE, legal_defender_policies(burned))
+
+    def test_the_brake_holds_at_the_root_too(self):
+        burned = replace(state_after(A.FS_CONSISTENCY_PROBE), unsafe_events=1)
+        allowed = frozenset({P.DECOY_DISCLOSURE, P.PERSONA_LLM})
+        self.assertNotIn(P.DECOY_DISCLOSURE, legal_defender_policies(burned, allowed))
 
 
 class TestAttackerEffects(unittest.TestCase):
@@ -270,13 +383,33 @@ class TestAttackerEffects(unittest.TestCase):
         after = apply_attacker(risky, A.REPEAT_CONSISTENCY_CHECK)
         self.assertLess(after.consistency_debt, risky.consistency_debt)
 
-    def test_unsafe_events_charged_to_the_policy_that_permitted_them(self):
-        permissive = replace(state_after(A.OS_FINGERPRINT), prev_defender=P.PERSONA_LLM)
-        refusing = replace(
-            state_after(A.OS_FINGERPRINT), prev_defender=P.PERMISSION_DENIAL
-        )
-        self.assertEqual(apply_attacker(permissive, A.TOOL_ABUSE).unsafe_events, 1)
-        self.assertEqual(apply_attacker(refusing, A.TOOL_ABUSE).unsafe_events, 0)
+    def test_tool_abuse_is_intelligence_not_a_penalty(self):
+        """An attacker deploying a miner is what a honeypot is *for*.
+
+        A previous model charged this to whichever policy "permitted" it,
+        blaming our LLM reply for the attacker's next command. That was
+        causally wrong — they run `chmod +x` regardless of how we narrated
+        the previous line — and at weight 10.0 it exceeded every possible
+        gain, making PERSONA_LLM unselectable. See scripts/planner_diff.py.
+        """
+        s = state_after(A.OS_FINGERPRINT)
+        after = apply_attacker(s, A.TOOL_ABUSE)
+        self.assertGreater(after.ttp_value, s.ttp_value)
+        self.assertGreater(after.intel_value, s.intel_value)
+        self.assertEqual(after.unsafe_events, s.unsafe_events)
+
+    def test_no_attacker_action_ever_charges_an_unsafe_event(self):
+        """unsafe_events counts things *we* got wrong, and is supplied by
+        the runtime at the root. Nothing the attacker does may increment
+        it, or the search starts punishing us for their success."""
+        for prev in (None, *DefenderPolicy):
+            base = replace(state_after(A.OS_FINGERPRINT), prev_defender=prev)
+            for action in ATTACKER_MOVES:
+                self.assertEqual(
+                    apply_attacker(base, action).unsafe_events,
+                    base.unsafe_events,
+                    f"{action} after {prev}",
+                )
 
     def test_novelty_is_marginal_not_cumulative(self):
         """The fifth `uname` must be worth less than the first.
