@@ -320,6 +320,23 @@ coverage report --include='*/cowrie/llm/*'
   more realistic for `tail -f`-like commands. Trade-off: markdown
   stripping + observation-leak redaction run at end-of-stream rather
   than per chunk.
+- **The minimax response planner is present but not wired in.**
+  `cowrie/llm/planner/` implements a depth-limited minimax search over
+  response policies, with alpha-beta pruning proven equivalent to a plain
+  minimax oracle (`test_llm_minimax_equivalence.py`: exact value and
+  root-move agreement over 150 seeded states × depths 1-4, with per-pair
+  node dominance; `minimax-bench` reports ~13x fewer nodes with move
+  ordering). Nothing in the response path imports it, so it changes no
+  behavior. It is unwired because `scripts/planner_diff.py` — which
+  replays the `attacker_sim` patterns through the real responder/download
+  probes — showed the planner **reproduces the existing if-ladder's
+  decision on every one of the 67 decidable commands**, and that depth-1
+  greedy matches depth-4 search exactly on all of them. On recon-heavy
+  traffic the if-ladder is already near-optimal, so there is nothing for a
+  search to improve; its `planner_depth` is unjustified until some future
+  state (token pressure, re-probe risk, accumulated safety signals) gives
+  lookahead something to discriminate on. Treat it as a tested algorithm
+  awaiting a problem, not a shipped feature.
 
 ## Known security caveats
 
