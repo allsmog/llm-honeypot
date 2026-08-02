@@ -228,8 +228,12 @@ def _fmt_time(mtime: float) -> str:
 
 
 def render_ls(vfs: VFS, path: str, *, long: bool, all_: bool,
-              username: str) -> str | None:
-    """Render `ls [path]`. Returns None to defer to the LLM."""
+              username: str, one_per_line: bool = False) -> str | None:
+    """Render `ls [path]`. Returns None to defer to the LLM.
+
+    ``one_per_line`` reflects stdout not being a tty (i.e. `ls` is feeding
+    a pipe), which is when real ls drops its column layout.
+    """
     path = _normpath(path)
 
     # `ls <file>` just echoes the path (or errors). Handle file targets.
@@ -258,7 +262,13 @@ def render_ls(vfs: VFS, path: str, *, long: bool, all_: bool,
 
     if not long:
         names = [n.name for n in items]
-        return ("  ".join(names) + "\n") if names else ""
+        if not names:
+            return ""
+        # Real ls emits one name per line when stdout is not a tty, and
+        # columns only when it is. Getting this wrong makes `ls | wc -l`
+        # report 1 instead of the entry count.
+        sep = "\n" if one_per_line else "  "
+        return sep.join(names) + "\n"
 
     lines = []
     if items:

