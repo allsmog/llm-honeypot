@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import configparser
 
+from twisted.internet import defer
 from twisted.trial import unittest
 
 from cowrie.llm.providers import ProviderRegistry
@@ -85,16 +86,29 @@ def _request() -> LLMRequest:
 
 
 def _providers():
-    """Every registered provider that can be constructed for testing.
+    """Every registered provider that can actually run in this environment.
 
-    A provider whose construction needs something we cannot fake (a real
-    OAuth token file, a live keychain) is skipped rather than failed — the
-    point is to cover what can be covered automatically, not to demand that
-    every backend be stubbable.
+    Two kinds of provider are skipped rather than failed, because the point
+    is to cover what can be covered automatically, not to demand that every
+    backend be stubbable:
+
+    * ones whose construction needs something we cannot fake (a real OAuth
+      token file, a live keychain);
+    * ones that report config errors even when handed full credentials,
+      which is how a provider says "my optional dependency is missing" —
+      the LangChain one does exactly that when `langchain` is not
+      installed. Those get their own test module with an injected fake.
+
+    Note this makes coverage environment-dependent: install the extra and
+    the provider is conformance-tested; don't and it is silently absent.
+    That is the right trade for an optional backend, but it does mean CI
+    coverage here is a floor, not a guarantee.
     """
     out = []
     for name in ProviderRegistry.available():
         try:
+            if ProviderRegistry.validate(name, _config()):
+                continue  # unavailable here — see docstring
             out.append((name, ProviderRegistry.create(name, _config())))
         except Exception:
             continue
@@ -127,27 +141,51 @@ class TestProviderConformance(unittest.TestCase):
     def test_upstream_error_yields_empty_string_not_a_failure(self):
         """Provider trouble must degrade to an empty prompt, never break
         the SSH session — an abrupt disconnect is a louder tell than a
-        command that produced no output."""
+        command that produced no output.
+
+        Results are gathered rather than read synchronously because a
+        provider is free to be asynchronous: the LangChain one bridges a
+        sync library with deferToThread, so its Deferred has not fired by
+        the time generate() returns.
+        """
+        pending = []
         for name, provider in self.providers:
             provider.agent = StubAgent(status=500, body=b'{"error":"boom"}')
-            result = self.successResultOf(provider.generate(_request()))
-            self.assertEqual(result, "", f"{name} did not degrade to empty string")
-        self.flushLoggedErrors()
+            pending.append(
+                provider.generate(_request()).addCallback(
+                    lambda result, n=name: self.assertEqual(
+                        result, "", f"{n} did not degrade to empty string"
+                    )
+                )
+            )
+
+        def done(_):
+            self.flushLoggedErrors()
+
+        return defer.gatherResults(pending).addCallback(done)
 
     def test_successful_response_populates_usage(self):
         """Without this, cost telemetry logs zeros forever and a token cap
         cannot fire — and nothing distinguishes 'free' from 'unmeasured'."""
+        pending = []
         for name, provider in self.providers:
-            reported = False
+            requests = []
             for body in _CANNED_BODIES:
                 provider.agent = StubAgent(status=200, body=body)
                 request = _request()
-                self.successResultOf(provider.generate(request))
-                reported = reported or bool(request.usage.get("total_tokens"))
-            self.assertTrue(
-                reported,
-                f"{name} reported no token usage for any known response shape",
+                requests.append(request)
+                pending.append(provider.generate(request))
+            self.addCleanup(
+                lambda n=name, rs=requests: self.assertTrue(
+                    any(r.usage.get("total_tokens") for r in rs),
+                    f"{n} reported no token usage for any known response shape",
+                )
             )
+
+        def done(_):
+            self.flushLoggedErrors()
+
+        return defer.gatherResults(pending).addCallback(done)
 
     def test_streaming_providers_parse_their_own_wire_format(self):
         """A provider that claims streaming must actually decode a stream.

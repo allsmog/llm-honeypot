@@ -70,6 +70,12 @@ rethinkdblog = ["rethinkdb"]
 s3 = ["botocore"]
 slack = ["slackclient"]
 influxdb = ["influxdb"]
+# Reaches any backend LangChain speaks to (local Ollama, hosted OpenAI,
+# Gemini, Bedrock, vLLM) via [llm] provider = langchain. Optional because
+# it is a large transitive tree on an internet-facing host, and because it
+# does not support every interpreter in our CI matrix. Install the
+# integration package for your backend alongside it, e.g. langchain-ollama.
+langchain = ["langchain>=0.3", "langchain-core>=0.3"]
 dev = [
 "build==1.5.0",
 "coverage==7.14.0",

@@ -396,8 +396,41 @@ log_raw = false
 #   anthropic_oauth  - Anthropic Messages API, OAuth bearer token (Claude Code session)
 #   codex_apikey     - OpenAI /v1/chat/completions, Bearer api-key auth
 #   codex_oauth      - Codex CLI OAuth bearer token (ChatGPT Plus/Pro session)
+#   langchain        - anything LangChain speaks to; see langchain_model below
 # (default: anthropic_apikey)
 #provider = anthropic_apikey
+
+# Model for the `langchain` provider, in LangChain's "provider:model" form.
+# This is the route to backends we have no hand-written adapter for —
+# local models, Gemini, Bedrock, vLLM — without writing code:
+#   ollama:llama3.1              (local, no API key, no per-token cost)
+#   openai:gpt-4o-mini
+#   google_genai:gemini-2.0-flash
+#   anthropic:claude-haiku-4-5-20251001
+# Requires the optional extra plus the integration package for your
+# backend: `pip install 'llm-honeypot[langchain]' langchain-ollama`.
+# LangChain is optional because it is a large transitive dependency tree on
+# a deliberately internet-facing host, and because it does not support
+# every interpreter this project is tested against.
+#
+# Trade-off worth knowing: this provider bridges LangChain's synchronous
+# API onto Twisted with deferToThread, consuming one worker from the
+# default pool of ten per in-flight call. The native HTTP providers are
+# fully async and have no such ceiling, so this path queues under heavy
+# concurrency where they would not. Measure before using it on a busy
+# sensor. Falls back to [llm] model when unset.
+# (default: empty)
+#langchain_model = ollama:llama3.1
+
+# Wall-clock ceiling on a single upstream call, in seconds. 0 disables it.
+# Without a ceiling, a backend that accepts the connection and then stalls
+# holds the session open until [honeypot] interactive_timeout reaps it —
+# the attacker sits at a dead prompt for three minutes, which is a far
+# louder tell than an empty response. Much likelier against a self-hosted
+# model server than a hosted API. On expiry the turn resolves to an empty
+# response and logs cowrie.llm.error.
+# (default: 30)
+#request_timeout_seconds = 30
 
 # Model name passed to the provider. Defaults are provider-specific:
 #   anthropic_*: claude-haiku-4-5-20251001   (fast + cheap, recommended)

@@ -10,6 +10,7 @@ from cowrie.llm.providers import (
     anthropic_oauth,
     codex_apikey,
     codex_oauth,
+    langchain_provider,
 )
 from cowrie.llm.providers.base import LLMMessage, LLMProvider, LLMRequest
 from cowrie.llm.providers.registry import ProviderRegistry
@@ -23,4 +24,5 @@ __all__ = [
     "anthropic_oauth",
     "codex_apikey",
     "codex_oauth",
+    "langchain_provider",
 ]

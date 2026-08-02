@@ -98,7 +98,32 @@ provider = codex_oauth
 codex_oauth_token_file = ~/.codex/auth.json
 ```
 
+## Using any other model
+
+Before writing an adapter, check whether the `langchain` provider already
+reaches your backend — it covers local Ollama, hosted OpenAI, Gemini,
+Bedrock, vLLM and most things else, by config alone:
+
+```ini
+[llm]
+provider = langchain
+langchain_model = ollama:llama3.1     # provider:model, LangChain's form
+```
+
+```bash
+pip install 'llm-honeypot[langchain]' langchain-ollama
+```
+
+It is an optional extra: LangChain is a large transitive dependency tree
+and this host is deliberately internet-facing. It also bridges LangChain's
+synchronous API onto Twisted with `deferToThread`, taking one worker from
+the default pool of ten per in-flight call — so it queues under heavy
+concurrency where the native HTTP providers do not.
+
 ## Adding a new provider
+
+Write one when you need wire-level control the LangChain route doesn't give
+you.
 
 1. Create `src/cowrie/llm/providers/your_provider.py`:
    ```python
@@ -112,14 +137,46 @@ codex_oauth_token_file = ~/.codex/auth.json
        @property
        def model(self): ...
        def _build_headers(self): ...
-       def _format_body(self, request: LLMRequest): ...
+       def _format_body(self, request: LLMRequest):
+           # request.system_text(), NOT request.system — see below.
+           ...
        def _parse_response(self, payload): ...
+
+       @classmethod
+       def validate_config(cls, config):
+           # Return human-readable errors for missing credentials. Without
+           # this the honeypot starts happily and fails on the attacker's
+           # first command with a 401 and an empty shell.
+           return []
    ```
-2. Add `import cowrie.llm.providers.your_provider` to
+2. Add it to the import tuple and `__all__` in
    `src/cowrie/llm/providers/__init__.py`.
 3. Document its config keys in `cowrie.cfg.dist` under `[llm]`.
 
-That's it — `LLMClient` will pick it up via `[llm] provider = your_provider`.
+`LLMClient` then picks it up via `[llm] provider = your_provider`, and
+`test_llm_provider_conformance.py` covers it automatically — it loops the
+registry rather than naming providers.
+
+**Three traps, all of which fail silently:**
+
+- **Use `request.system_text()`, never `request.system`.** The interactive
+  protocol only populates `system_blocks`; `system` stays empty. Read it
+  directly and you send no system prompt at all — no persona, no world
+  state, no instructions — and the honeypot answers plausibly enough that
+  nothing looks broken while being a generic assistant. Only touch
+  `system_blocks` yourself if you act on the per-block `cacheable` flag,
+  as the Anthropic providers do for cache breakpoints.
+- **Override `_normalize_usage` if your backend reports neither the
+  Anthropic nor the OpenAI usage shape.** Otherwise `request.usage` stays
+  empty, which reads downstream as "this turn was free": telemetry logs
+  zeros and a per-session token cap never fires.
+- **Override `_parse_stream_event` if you set `_supports_streaming()`
+  True.** The default parses Anthropic's SSE event names. OpenAI-style
+  chunks carry no `type` field at all, so the default matches nothing and
+  the stream yields empty text; `providers.streaming.parse_openai_event` is
+  supplied for that case. A mismatch is now logged and falls back to a
+  buffered call rather than serving a blank shell, but it still costs a
+  round trip.
 
 ## What the fork adds beyond the provider abstraction
 

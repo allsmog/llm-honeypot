@@ -110,6 +110,12 @@ def _normalize_anthropic_usage(payload_usage: object) -> dict[str, int]:
         out["cache_creation_tokens"] = int(payload_usage["cache_creation_input_tokens"])
     if cached:
         out["cached_tokens"] = cached
+    if not out:
+        # Nothing recognized. Return {} rather than {"total_tokens": 0} so
+        # "this backend reported no usage" stays distinguishable from "this
+        # turn genuinely cost nothing" — a per-session token cap needs that
+        # distinction, and so does anyone reading the telemetry.
+        return {}
     out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
     return out
 
@@ -139,7 +145,7 @@ def _normalize_openai_usage(payload_usage: object) -> dict[str, int]:
             out["cached_tokens"] = cached
     if "total_tokens" in payload_usage:
         out["total_tokens"] = int(payload_usage["total_tokens"])
-    else:
+    elif out:
         out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
     return out
 
