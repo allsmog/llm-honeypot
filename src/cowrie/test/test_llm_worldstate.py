@@ -128,3 +128,96 @@ class TestUserStack(unittest.TestCase):
         w = WorldState()
         w.push_user("root")
         self.assertIn("Effective-user stack", w.to_prompt_section())
+
+
+class TestFactLedger(unittest.TestCase):
+    """What we already told the session, so a re-probe replays it.
+
+    An attacker checking for a honeypot asks the same thing twice and
+    compares — which is exactly what FINGERPRINT_PROBE does. Recording the
+    first answer lets the model repeat rather than re-derive.
+    """
+
+    def test_records_and_retrieves(self):
+        w = WorldState()
+        w.record_claim(key="os.kernel", excerpt="Linux h4 5.15.0", turn=1, source="llm")
+        claim = w.claim_for("os.kernel")
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.excerpt, "Linux h4 5.15.0")
+        self.assertEqual(claim.turn, 1)
+
+    def test_last_write_wins(self):
+        w = WorldState()
+        w.record_claim(key="hw.mem", excerpt="first", turn=1, source="llm")
+        w.record_claim(key="hw.mem", excerpt="second", turn=2, source="deterministic")
+        self.assertEqual(w.claim_for("hw.mem").excerpt, "second")
+        self.assertEqual(w.claim_for("hw.mem").source, "deterministic")
+
+    def test_blank_key_or_answer_is_ignored(self):
+        w = WorldState()
+        w.record_claim(key="", excerpt="x", turn=1, source="llm")
+        w.record_claim(key="os.kernel", excerpt="", turn=1, source="llm")
+        self.assertEqual(w.told_facts, {})
+
+    def test_long_excerpts_are_truncated(self):
+        w = WorldState()
+        w.record_claim(key="k", excerpt="x" * 5000, turn=1, source="llm")
+        self.assertLessEqual(
+            len(w.claim_for("k").excerpt), WorldState.MAX_FACT_EXCERPT + 1
+        )
+
+    def test_unknown_key_returns_none(self):
+        self.assertIsNone(WorldState().claim_for("nope"))
+        self.assertIsNone(WorldState().claim_for(None))
+
+    # -- prompt rendering ---------------------------------------------------
+
+    def test_llm_claims_render_into_the_prompt(self):
+        w = WorldState()
+        w.record_claim(
+            key="os.kernel", excerpt="Linux h4 5.15.0-122", turn=1, source="llm"
+        )
+        section = w.to_prompt_section()
+        self.assertIn("os.kernel", section)
+        self.assertIn("5.15.0-122", section)
+        self.assertIn("repeat the same values", section)
+
+    def test_deterministic_claims_do_not_spend_prompt_tokens(self):
+        """The emulator reproduces its own answers by construction, so
+        reminding the model of them costs input tokens every turn and buys
+        nothing. This block lands in the *uncached* tail."""
+        w = WorldState()
+        w.record_claim(key="id.user", excerpt="root", turn=1, source="deterministic")
+        self.assertEqual(w.to_prompt_section(), "")
+
+    def test_a_facts_only_world_still_renders(self):
+        """Regression guard for the early-return guard.
+
+        If told_facts is left out of it, a session whose only state is
+        recorded facts renders no section at all — silently, with no error
+        and nothing in the logs.
+        """
+        w = WorldState()
+        self.assertEqual(w.to_prompt_section(), "")
+        w.record_claim(key="os.kernel", excerpt="Linux h4", turn=1, source="llm")
+        self.assertNotEqual(w.to_prompt_section(), "")
+
+    def test_prompt_block_is_capped(self):
+        w = WorldState()
+        cap = WorldState.MAX_FACTS_IN_PROMPT
+        for i in range(cap + 5):
+            w.record_claim(key=f"k{i}", excerpt=f"value{i}", turn=i, source="llm")
+        section = w.to_prompt_section()
+        self.assertIn(f"({cap + 5 - cap} more, omitted)", section)
+        # Most recent survive the truncation.
+        self.assertIn(f"value{cap + 4}", section)
+
+    def test_newlines_are_flattened_so_one_claim_is_one_line(self):
+        w = WorldState()
+        w.record_claim(key="k", excerpt="line1\nline2", turn=1, source="llm")
+        rendered = [
+            ln for ln in w.to_prompt_section().splitlines() if ln.startswith("  [k]")
+        ]
+        self.assertEqual(len(rendered), 1)
+        self.assertIn("line1", rendered[0])
+        self.assertIn("line2", rendered[0])

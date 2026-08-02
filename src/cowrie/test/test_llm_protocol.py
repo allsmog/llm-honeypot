@@ -591,3 +591,193 @@ class TestObservationLeakStrip(unittest.TestCase):
         self.assertNotIn("[SHELL_OBSERVED]", rendered)
         self.assertNotIn("[/SHELL_OBSERVED]", rendered)
         self.assertNotIn("sensitive", rendered)
+
+
+class TestFactLedger(unittest.TestCase):
+    """Recording what we already told the attacker, so re-probes agree.
+
+    The threat this addresses: an attacker checking for a honeypot asks the
+    same thing twice and compares. Our own FINGERPRINT_PROBE adversary does
+    exactly that.
+    """
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol(llm_response="Linux h4 6.6.0\n")
+
+    def tearDown(self) -> None:
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def test_deterministic_answer_is_recorded(self):
+        self.proto.lineReceived(b"uname -r")
+        claim = self.proto.world.claim_for("os.kernel")
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.source, "deterministic")
+
+    def test_llm_answer_is_recorded_and_reaches_the_next_prompt(self):
+        """The whole point: the second probe must see the first answer.
+
+        `dpkg -l` is not in the emulator's dispatch table, so it reaches
+        the model — and it has a fact family (pkg.list), so the answer is
+        worth remembering. `apt list --installed` shares that family, which
+        is what makes the re-probe detectable at all.
+        """
+        self.proto.lineReceived(b"dpkg -l")
+        claim = self.proto.world.claim_for("pkg.list")
+        self.assertIsNotNone(claim, "LLM answer was not recorded")
+        self.assertEqual(claim.source, "llm")
+
+        self.proto.lineReceived(b"apt list --installed")
+        tail = self.stub.calls[-1].system_blocks[1][0]
+        self.assertIn("repeat the same values", tail)
+        self.assertIn("pkg.list", tail)
+
+    def test_recorded_excerpt_is_the_redacted_text_the_attacker_saw(self):
+        """Not the raw model output — post markdown-strip and post
+        leak-redaction, or the ledger would replay something never shown."""
+        proto, _tr, _stub = _make_protocol(llm_response="```\nii  bash  5.1\n```")
+        self.addCleanup(lambda: proto.setTimeout(None))
+        proto.lineReceived(b"dpkg -l")
+        claims = [c for c in proto.world.told_facts.values() if c.source == "llm"]
+        for claim in claims:
+            self.assertNotIn("```", claim.excerpt)
+
+    def test_volatile_commands_are_not_recorded(self):
+        """`date` is supposed to change between calls; recording it would
+        manufacture a contradiction out of correct behaviour."""
+        self.proto.lineReceived(b"date")
+        self.assertIsNone(self.proto.world.claim_for("date"))
+        self.assertEqual(self.proto.world.told_facts, {})
+
+    def test_a_broken_ledger_never_costs_the_attacker_their_prompt(self):
+        """Fault injection — the one that matters.
+
+        An exception on the recording path before the terminal write would
+        leave the session with no output and no prompt, hanging until
+        interactive_timeout reaps it three minutes later. That is the most
+        visible tell this honeypot can produce, so recording is placed
+        after the write AND wrapped.
+        """
+        def explode(**kwargs):
+            raise RuntimeError("ledger is broken")
+
+        self.proto.world.record_claim = explode
+        self.tr.clear()
+        self.proto.lineReceived(b"uname -r")
+        output = self.tr.value()
+        # The kernel string is persona-dependent, so assert on structure:
+        # a non-empty answer landed AND the prompt was drawn.
+        self.assertIn(b"#", output, "prompt was not drawn")
+        answer = output.split(b"\n")[0].strip()
+        self.assertTrue(answer, "no answer was written to the terminal")
+        self.flushLoggedErrors()
+
+    def test_disabling_the_ledger_leaves_the_prompt_untouched(self):
+        from cowrie.core.config import CowrieConfig
+
+        original = CowrieConfig.get("llm", "fact_ledger", fallback=None)
+        CowrieConfig.set("llm", "fact_ledger", "false")
+        try:
+            self.proto.lineReceived(b"uname -r")
+            self.assertEqual(self.proto.world.told_facts, {})
+        finally:
+            if original is None:
+                CowrieConfig.remove_option("llm", "fact_ledger")
+            else:
+                CowrieConfig.set("llm", "fact_ledger", original)
+
+
+class TestTokenBudget(unittest.TestCase):
+    """Cost bounded by spend, not just by command count.
+
+    max_commands_per_session counts turns; a session of long outputs can
+    cost more than two hundred short ones.
+    """
+
+    def setUp(self) -> None:
+        self.proto, self.tr, self.stub = _make_protocol()
+
+    def tearDown(self) -> None:
+        from cowrie.core.config import CowrieConfig
+
+        CowrieConfig.remove_option("llm", "max_tokens_per_session")
+        try:
+            self.proto.setTimeout(None)
+        except Exception:
+            pass
+
+    def _set_cap(self, value: str) -> None:
+        from cowrie.core.config import CowrieConfig
+
+        if not CowrieConfig.has_section("llm"):
+            CowrieConfig.add_section("llm")
+        CowrieConfig.set("llm", "max_tokens_per_session", value)
+
+    def test_all_four_buckets_are_summed(self):
+        """On Anthropic, total_tokens is input+output only — cache reads
+        and writes are separate buckets and excluded from it. Using it
+        directly would undercount every cache-warm turn."""
+        self.proto._record_usage(
+            {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_tokens": 900,
+                "cache_creation_tokens": 50,
+                "total_tokens": 110,
+            }
+        )
+        self.assertEqual(self.proto._session_tokens, 1060)
+
+    def test_usage_accumulates_across_turns(self):
+        self.proto._record_usage({"input_tokens": 10, "output_tokens": 5})
+        self.proto._record_usage({"input_tokens": 20, "output_tokens": 5})
+        self.assertEqual(self.proto._session_tokens, 40)
+
+    def test_empty_usage_is_counted_as_unmeasured_not_free(self):
+        """A failing provider reports success with an empty usage dict.
+        Treating that as zero makes a broken backend look like a cheap
+        one, so it is tracked separately."""
+        self.proto._record_usage({})
+        self.assertEqual(getattr(self.proto, "_session_tokens", 0), 0)
+        self.assertEqual(self.proto._turns_without_usage, 1)
+
+    def test_zero_means_unlimited_and_is_the_default(self):
+        self.proto._session_tokens = 10**9
+        self.assertFalse(self.proto._token_budget_exhausted())
+
+    def test_cap_fires_once_spend_reaches_it(self):
+        self._set_cap("1000")
+        self.proto._session_tokens = 999
+        self.assertFalse(self.proto._token_budget_exhausted())
+        self.proto._session_tokens = 1000
+        self.assertTrue(self.proto._token_budget_exhausted())
+
+    def test_exhaustion_is_logged_once(self):
+        self._set_cap("100")
+        self.proto._session_tokens = 500
+        self.assertTrue(self.proto._token_budget_exhausted())
+        self.assertTrue(self.proto._token_budget_logged)
+        # Still exhausted on later turns, but no repeat log line.
+        self.assertTrue(self.proto._token_budget_exhausted())
+
+    def test_exhausted_session_degrades_instead_of_disconnecting(self):
+        """A plausible resource error keeps the session alive. Hanging up
+        abruptly is a far louder tell than a command that failed."""
+        self._set_cap("100")
+        self.proto._session_tokens = 500
+        self.tr.clear()
+        self.proto.lineReceived(b"dpkg -l")
+        self.assertEqual(len(self.stub.calls), 0, "LLM was called past the cap")
+        self.assertIn(b"cannot fork", self.tr.value())
+        self.assertIn(b"#", self.tr.value(), "prompt was not drawn")
+
+    def test_deterministic_commands_are_unaffected_by_the_cap(self):
+        """Local renders cost nothing, so they must keep working after the
+        token budget is gone."""
+        self._set_cap("100")
+        self.proto._session_tokens = 500
+        self.tr.clear()
+        self.proto.lineReceived(b"whoami")
+        self.assertNotIn(b"cannot fork", self.tr.value())

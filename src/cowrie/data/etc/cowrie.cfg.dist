@@ -570,6 +570,55 @@ log_raw = false
 # (default: true)
 #pipe_filters = true
 
+# Remember what we have already told a session, so a repeated question
+# gets the same answer. An attacker checking for a honeypot asks the same
+# thing twice and compares -- our own fingerprint adversary does exactly
+# that -- and the model has no memory of a turn that has scrolled out of
+# the replay window.
+#
+# Answers are keyed by *fact*, not by command text, so `uname -a`,
+# `uname -r` and `cat /proc/version` all count as the same question. Only
+# model-generated answers are recorded into the prompt: what the
+# deterministic emulator produces is reproducible on demand, so repeating
+# it back would cost input tokens every turn and buy nothing. Commands
+# whose answer is meant to change (date, w, top) are never tracked, since
+# recording them would manufacture a contradiction out of correct
+# behaviour.
+#
+# Note this reduces the chance of a contradiction; it cannot eliminate it.
+# We deliberately do not parse model output, so this shows the model its
+# own earlier answer and asks it to repeat -- it cannot force the issue.
+# (default: true)
+#fact_ledger = true
+
+# How many remembered answers to carry in the prompt. This block lands in
+# the uncached tail, so every line is billed again on each later turn --
+# keep it small. Oldest are dropped first.
+# (default: 12)
+#max_facts_in_prompt = 12
+
+# Per-session ceiling on total LLM tokens (input + output + cache reads +
+# cache writes). 0 disables it, which is the default.
+#
+# Complements max_commands_per_session, which counts *turns*: a session of
+# fifty long `cat` responses can cost more than two hundred short ones, and
+# only this key bounds that. Distinct from [llm] max_tokens above, which
+# caps a single response.
+#
+# Two details worth knowing. The count is summed from what the provider
+# actually reported, so it reflects real cache hit rates rather than an
+# estimate -- but it necessarily lags by one turn, since usage is only
+# known after a response lands, so the cap can overshoot by a single
+# response. And a backend whose usage shape we cannot read reports
+# nothing; those turns are tracked as unmeasured rather than as free, so a
+# silently-failing provider does not look cheap.
+#
+# On exhaustion the session degrades to a plausible resource error and
+# keeps going. Deterministic commands are unaffected -- they cost nothing
+# -- so a capped-out session is still usable rather than dead.
+# (default: 0)
+#max_tokens_per_session = 0
+
 # Full-screen interactive programs. top/htop, vi/vim, and less/more take
 # over the terminal (alternate screen + raw keystrokes) instead of being
 # narrated one-shot by the LLM — the classic vim/top honeypot tell. The

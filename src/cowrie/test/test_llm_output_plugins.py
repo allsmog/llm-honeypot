@@ -31,6 +31,7 @@ NEW_LLM_EVENT_IDS = (
     "cowrie.llm.deterministic",
     "cowrie.llm.attack",
     "cowrie.llm.editor_save",
+    "cowrie.llm.token_budget_exhausted",
 )
 
 

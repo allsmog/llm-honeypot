@@ -16,7 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import attack_map, cmd_parser, downloader, scp
+from cowrie.llm import attack_map, cmd_parser, downloader, factkeys, scp
 from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
@@ -376,7 +376,100 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         jitter_min = CowrieConfig.getint("llm", "fastpath_jitter_ms_min", fallback=5)
         jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
         self._show_prompt(jitter_min, jitter_max)
+        # Strictly after the write and the prompt: recording is bookkeeping,
+        # and a bug in it must never cost the attacker their output.
+        self._record_claim(command, result.output, source="deterministic")
         return True
+
+    def _record_usage(self, usage: dict) -> None:
+        """Accumulate this turn's real token spend.
+
+        Two traps, both of which would silently make a cap useless:
+
+        * On Anthropic, ``total_tokens`` is input+output only — cache reads
+          and cache writes are reported as separate buckets and excluded.
+          Summing all four is the closest thing to a billable figure we
+          have.
+        * A provider that fails reports success with an empty usage dict
+          (see providers/base.py). Counting that as zero would be
+          indistinguishable from a genuinely free turn, so empty usage is
+          tracked separately instead — a session full of unmeasured turns
+          is a broken backend, not a cheap one.
+        """
+        if not usage:
+            self._turns_without_usage = getattr(self, "_turns_without_usage", 0) + 1
+            return
+        spend = (
+            usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + usage.get("cached_tokens", 0)
+            + usage.get("cache_creation_tokens", 0)
+        )
+        self._session_tokens = getattr(self, "_session_tokens", 0) + spend
+
+    def _token_budget_exhausted(self) -> bool:
+        """True once this session has spent its token allowance.
+
+        Necessarily lags by one turn: usage is only known after a response
+        lands, so the cap is checked against what *previous* turns cost and
+        can overshoot by a single response. Bounding that exactly would
+        need a pre-flight token count per provider, which is not worth the
+        complexity for a spend ceiling.
+        """
+        cap = CowrieConfig.getint("llm", "max_tokens_per_session", fallback=0)
+        if cap <= 0:
+            return False  # unlimited, and the default
+        spent = getattr(self, "_session_tokens", 0)
+        if spent < cap:
+            return False
+        if not getattr(self, "_token_budget_logged", False):
+            log.msg(
+                eventid="cowrie.llm.token_budget_exhausted",
+                tokens=spent,
+                cap=cap,
+                sessionno=f"S{self.sessionno}",
+                format="LLM token budget exhausted: %(tokens)d >= %(cap)d",
+            )
+            self._token_budget_logged = True
+        return True
+
+    def _record_claim(self, command: str, answer: str, *, source: str) -> None:
+        """Remember what we just told the attacker, keyed by fact family.
+
+        Never raises and never blocks the response path. An exception here
+        before the terminal write would leave the session with no output
+        and no prompt — it would hang until [honeypot] interactive_timeout
+        reaps it three minutes later, which is the most visible tell this
+        honeypot can produce.
+        """
+        if not CowrieConfig.getboolean("llm", "fact_ledger", fallback=True):
+            return
+        try:
+            if not answer or not hasattr(self, "world"):
+                return
+            key = factkeys.fact_family(command)
+            if key is None:
+                return
+            self.world.MAX_FACTS_IN_PROMPT = CowrieConfig.getint(
+                "llm", "max_facts_in_prompt", fallback=WorldState.MAX_FACTS_IN_PROMPT
+            )
+            self.world.record_claim(
+                key=key,
+                excerpt=answer,
+                turn=getattr(self, "_command_count", 0),
+                source=source,
+            )
+        except Exception as e:
+            # Swallowed so a ledger bug can never break a live session —
+            # but logged, because a silent `except: pass` here hid a
+            # missing import during development and the feature simply
+            # did nothing while every test that checked output passed.
+            log.msg(
+                eventid="cowrie.llm.error",
+                error=f"fact ledger: {e}"[:200],
+                sessionno=f"S{self.sessionno}",
+                format="%(error)s",
+            )
 
     def _shell_context(self) -> respondermod.ShellContext:
         """Snapshot the session state the deterministic responder needs."""
@@ -664,6 +757,14 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             self._show_prompt()
             return
 
+        if self._token_budget_exhausted():
+            if self.terminal is not None:
+                self.terminal.write(
+                    b"bash: cannot fork: Resource temporarily unavailable\n"
+                )
+            self._show_prompt()
+            return
+
         if not hasattr(self, "llm_client"):
             # Prefer the realm-owned client (constructed once at startup,
             # shared across sessions). Fall back to per-session construction
@@ -673,6 +774,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             self.llm_client = shared if shared is not None else LLMClient()
             self.command_history = []
 
+        self._last_llm_command = command
         user_msg = command
         if observation:
             user_msg = f"{observation}\n{command}"
@@ -763,6 +865,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         """
         latency_ms = int((time.time() - getattr(self, "_llm_t0", time.time())) * 1000)
         usage = (request.usage if request else None) or {}
+        self._record_usage(usage)
         log.msg(
             eventid="cowrie.llm.response",
             output=response,
@@ -798,9 +901,20 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 self.terminal.write(b"\n")
             else:
                 self.terminal.write(f"{clean_response}\n".encode())
+            # clean_response is post-markdown-strip and post-leak-redaction,
+            # so the excerpt is exactly what the attacker saw.
+            self._pending_claim = clean_response
         # If no response, just show the prompt silently (like an empty command)
 
         self._show_prompt()
+        # Recorded strictly after the write and the prompt: bookkeeping must
+        # never be able to cost the attacker their output.
+        pending = getattr(self, "_pending_claim", "")
+        if pending:
+            self._pending_claim = ""
+            self._record_claim(
+                getattr(self, "_last_llm_command", ""), pending, source="llm"
+            )
 
     def _handle_llm_error(self, err):
         """

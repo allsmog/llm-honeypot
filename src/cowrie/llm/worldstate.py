@@ -39,10 +39,34 @@ class ProcessFact:
 
 
 @dataclass
+class ClaimFact:
+    """Something we have already told this session, keyed by fact family.
+
+    Recorded so a re-probe replays the first answer instead of the model
+    improvising a second one. We deliberately do not parse model output
+    (see cmd_parser.py's ABOUTME for why that judgement stands), so this
+    stores *what we said*, not a parsed value — enough to show the model
+    its own earlier answer and ask it to repeat.
+    """
+
+    key: str
+    excerpt: str
+    turn: int
+    source: str  # "deterministic" | "llm"
+
+    #: Deterministic renders are reproducible by construction, so they need
+    #: no reminder; LLM answers are the ones that drift.
+    @property
+    def needs_replay(self) -> bool:
+        return self.source == "llm"
+
+
+@dataclass
 class WorldState:
     files: dict[str, FileFact] = field(default_factory=dict)
     env_vars: dict[str, str] = field(default_factory=dict)
     processes: dict[int, ProcessFact] = field(default_factory=dict)
+    told_facts: dict[str, ClaimFact] = field(default_factory=dict)
     bg_pids: list[int] = field(default_factory=list)
     # Stack of effective usernames pushed by su / sudo -i. Empty means the
     # session's login user is in effect. The top of the stack is the
@@ -59,6 +83,44 @@ class WorldState:
     # prompt cost matters once the cache is busted.
     MAX_FILES_IN_PROMPT = 20
     MAX_PROCS_IN_PROMPT = 20
+    # This block lands in the *uncached* prompt tail, so every line is
+    # billed again on every later turn. Keep it small and the excerpts
+    # short; the point is to anchor a handful of durable facts, not to
+    # replay the session.
+    MAX_FACTS_IN_PROMPT = 12
+    MAX_FACT_EXCERPT = 200
+
+    def record_claim(
+        self, *, key: str, excerpt: str, turn: int, source: str
+    ) -> None:
+        """Remember that we asserted ``key``. Last write wins.
+
+        A deterministic answer overwrites an earlier LLM one deliberately:
+        once the emulator has produced the canonical text, that is the
+        version worth repeating.
+        """
+        if not key or not excerpt:
+            return
+        text = excerpt.strip()
+        if len(text) > self.MAX_FACT_EXCERPT:
+            text = text[: self.MAX_FACT_EXCERPT] + "…"
+        self.told_facts[key] = ClaimFact(
+            key=key, excerpt=text, turn=turn, source=source
+        )
+
+    def claim_for(self, key: str | None) -> ClaimFact | None:
+        return self.told_facts.get(key) if key else None
+
+    def replayable_claims(self) -> list[ClaimFact]:
+        """Claims worth spending prompt tokens on — LLM-sourced only.
+
+        Deterministic answers reproduce themselves, so reminding the model
+        of them costs input tokens on every later turn and buys nothing.
+        The guard in to_prompt_section() counts *these*, not raw
+        told_facts: otherwise a session holding only deterministic claims
+        emits a section header with nothing under it.
+        """
+        return [c for c in self.told_facts.values() if c.needs_replay]
 
     def add_file(
         self,
@@ -125,8 +187,15 @@ class WorldState:
         Returns the empty string when there's nothing to share (so the
         caller can omit the segment entirely and keep the cache hot).
         """
+        # told_facts belongs in this guard: leave it out and a session
+        # whose only state is recorded facts renders no section at all —
+        # silently, with no error and nothing in the logs.
         if not (
-            self.files or self.env_vars or self.processes or self.user_stack
+            self.files
+            or self.env_vars
+            or self.processes
+            or self.user_stack
+            or self.replayable_claims()
         ):
             return ""
 
@@ -175,5 +244,25 @@ class WorldState:
                 "Effective-user stack (su/sudo — whoami/id and the shell "
                 f"prompt must reflect the top): {' -> '.join(self.user_stack)}"
             )
+
+        # Only LLM-sourced claims are worth the prompt tokens. Facts the
+        # deterministic responder produced are reproducible on demand, so
+        # reminding the model of them costs input tokens every turn and
+        # buys nothing.
+        replayable = self.replayable_claims()
+        if replayable:
+            lines.append(
+                "Answers already given to this session. If any of these is "
+                "asked again — in any form — repeat the same values. Do not "
+                "re-derive or vary them:"
+            )
+            replayable.sort(key=lambda c: c.turn, reverse=True)
+            for claim in replayable[: self.MAX_FACTS_IN_PROMPT]:
+                snippet = claim.excerpt.replace("\n", " ⏎ ")
+                lines.append(f"  [{claim.key}] {snippet}")
+            if len(replayable) > self.MAX_FACTS_IN_PROMPT:
+                lines.append(
+                    f"  ... ({len(replayable) - self.MAX_FACTS_IN_PROMPT} more, omitted)"
+                )
 
         return "\n".join(lines)
