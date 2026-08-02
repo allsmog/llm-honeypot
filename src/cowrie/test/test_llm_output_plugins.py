@@ -32,6 +32,7 @@ NEW_LLM_EVENT_IDS = (
     "cowrie.llm.attack",
     "cowrie.llm.editor_save",
     "cowrie.llm.token_budget_exhausted",
+    "cowrie.llm.download_intercept",
 )
 
 

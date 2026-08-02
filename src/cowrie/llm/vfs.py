@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import stat as statmod
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -325,7 +326,17 @@ def render_stat(vfs: VFS, path: str, *, username: str) -> str | None:
 
 
 def _fake_inode(path: str) -> int:
-    return 130000 + (abs(hash(path)) % 700000)
+    """Stable inode for a path, across processes and restarts.
+
+    Was ``abs(hash(path))``, which Python randomises per process unless
+    PYTHONHASHSEED is pinned. So a `stat /etc/passwd` returned a different
+    inode every time the honeypot restarted, for a file nobody had
+    touched — an attacker who reconnects and re-stats sees the filesystem
+    apparently rebuilt underneath them. sha256 is stable by construction
+    and costs microseconds on a path-length input.
+    """
+    digest = hashlib.sha256(path.encode("utf-8")).digest()
+    return 130000 + (int.from_bytes(digest[:6], "big") % 700000)
 
 
 def _fmt_full_time(mtime: float) -> str:

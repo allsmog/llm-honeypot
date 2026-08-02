@@ -181,3 +181,94 @@ class FakeTransport(proto_helpers.StringTransport):
 
     def _emptyLine(self, width):
         return [(self.void, self._currentFormattingState()) for i in range(width)]
+
+    # ------------------------------------------------------------------
+    # Remaining ITerminalTransport surface.
+    #
+    # These are cursor/erase primitives the real Twisted insults terminal
+    # provides. They were absent, which made `clear` raise AttributeError
+    # on cursorHome — and worse, _try_interactive catches Exception and
+    # returns False, so a full-screen program (top/vi/less) hitting a
+    # missing method was silently *misrouted to the LLM* rather than
+    # failing. A test fixture that turns a crash into a wrong answer is
+    # the worst kind, so the surface is completed here rather than
+    # monkeypatched per test.
+    #
+    # Implemented as no-ops that record the call: this fixture models the
+    # byte stream, not a screen, and every consumer that matters asserts
+    # on transport.value(). `calls` lets a test assert a control sequence
+    # was issued without a full terminal emulator.
+
+    def _record(self, name: str, *args) -> None:
+        if not hasattr(self, "calls"):
+            self.calls: list[tuple] = []
+        self.calls.append((name, *args))
+
+    def cursorHome(self):
+        self._record("cursorHome")
+
+    def cursorPosition(self, column, line):
+        self._record("cursorPosition", column, line)
+
+    def cursorUp(self, n=1):
+        self._record("cursorUp", n)
+
+    def cursorDown(self, n=1):
+        self._record("cursorDown", n)
+
+    def cursorForward(self, n=1):
+        self._record("cursorForward", n)
+
+    def cursorBackward(self, n=1):
+        self._record("cursorBackward", n)
+
+    def saveCursor(self):
+        self._record("saveCursor")
+
+    def restoreCursor(self):
+        self._record("restoreCursor")
+
+    def deleteCharacter(self, n=1):
+        self._record("deleteCharacter", n)
+
+    def insertLine(self, n=1):
+        self._record("insertLine", n)
+
+    def deleteLine(self, n=1):
+        self._record("deleteLine", n)
+
+    def eraseToLineEnd(self):
+        self._record("eraseToLineEnd")
+
+    def eraseToLineBeginning(self):
+        self._record("eraseToLineBeginning")
+
+    def eraseLine(self):
+        self._record("eraseLine")
+
+    def eraseToDisplayEnd(self):
+        self._record("eraseToDisplayEnd")
+
+    def eraseToDisplayBeginning(self):
+        self._record("eraseToDisplayBeginning")
+
+    def index(self):
+        self._record("index")
+
+    def reverseIndex(self):
+        self._record("reverseIndex")
+
+    def nextLine(self):
+        self._record("nextLine")
+
+    def selectCharacterSet(self, charSet, which):
+        self._record("selectCharacterSet", charSet, which)
+
+    def selectGraphicRendition(self, *attributes):
+        self._record("selectGraphicRendition", *attributes)
+
+    def resetPrivateModes(self, modes):
+        self._record("resetPrivateModes", modes)
+
+    def setScrollRegion(self, first=None, last=None):
+        self._record("setScrollRegion", first, last)

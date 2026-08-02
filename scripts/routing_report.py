@@ -46,7 +46,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # ruff: noqa: E402 — these must follow the sys.path insert above so the
 # script runs from a checkout without the package being installed.
-from cowrie.llm import downloader, interactive, persona, responder
+from cowrie.llm import cmdchain, downloader, interactive, persona, responder
 from cowrie.llm.worldstate import WorldState
 
 #: Commands the shell fastpath answers before anything else is consulted.
@@ -89,7 +89,17 @@ def route(command: str, ctx) -> str:
     does not, the report quietly misattributes that traffic.
     """
     cmd = command.strip()
-    if not cmd or cmd.split()[0] in _FASTPATH_CMDS:
+    # A chained line is several commands; report where the FIRST one goes.
+    # This mirror previously did `cmd.split()[0] in _FASTPATH_CMDS`, which
+    # classified `cd /tmp || cd /` as benign fastpath — the same blind spot
+    # as the code it checks, and the reason this report did not catch the
+    # bug that scripts/probe_search.py found.
+    segments = cmdchain.split_chain(cmd)
+    if segments and len(segments) > 1:
+        cmd = segments[0][1]
+    if not cmd:
+        return FASTPATH
+    if cmd.split()[0] in _FASTPATH_CMDS and cmdchain.is_simple(cmd):
         return FASTPATH
     if responder.respond(cmd, ctx) is not None:
         return LOCAL

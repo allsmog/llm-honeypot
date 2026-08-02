@@ -53,6 +53,13 @@ class ClaimFact:
     excerpt: str
     turn: int
     source: str  # "deterministic" | "llm"
+    #: The command that produced this answer. Two commands can report the
+    #: same fact in different shapes — `whoami` says "root" where `id`
+    #: says "uid=0(root) gid=0(root)...". Without recording which one we
+    #: answered, the replay instruction could show the model a `whoami`
+    #: excerpt while it is answering `id`, and it would dutifully print
+    #: the wrong shape. Found by scripts/probe_search.py.
+    command: str = ""
 
     #: Deterministic renders are reproducible by construction, so they need
     #: no reminder; LLM answers are the ones that drift.
@@ -91,7 +98,7 @@ class WorldState:
     MAX_FACT_EXCERPT = 200
 
     def record_claim(
-        self, *, key: str, excerpt: str, turn: int, source: str
+        self, *, key: str, excerpt: str, turn: int, source: str, command: str = ""
     ) -> None:
         """Remember that we asserted ``key``. Last write wins.
 
@@ -105,7 +112,7 @@ class WorldState:
         if len(text) > self.MAX_FACT_EXCERPT:
             text = text[: self.MAX_FACT_EXCERPT] + "…"
         self.told_facts[key] = ClaimFact(
-            key=key, excerpt=text, turn=turn, source=source
+            key=key, excerpt=text, turn=turn, source=source, command=command
         )
 
     def claim_for(self, key: str | None) -> ClaimFact | None:
@@ -259,7 +266,11 @@ class WorldState:
             replayable.sort(key=lambda c: c.turn, reverse=True)
             for claim in replayable[: self.MAX_FACTS_IN_PROMPT]:
                 snippet = claim.excerpt.replace("\n", " ⏎ ")
-                lines.append(f"  [{claim.key}] {snippet}")
+                # Name the command: the same fact has different shapes per
+                # command, and the model must reproduce the shape it is
+                # being asked for, not the one we happened to record.
+                asked = f"`{claim.command}` -> " if claim.command else ""
+                lines.append(f"  [{claim.key}] {asked}{snippet}")
             if len(replayable) > self.MAX_FACTS_IN_PROMPT:
                 lines.append(
                     f"  ... ({len(replayable) - self.MAX_FACTS_IN_PROMPT} more, omitted)"

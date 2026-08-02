@@ -16,7 +16,7 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.python import failure, log
 
 from cowrie.core.config import CowrieConfig
-from cowrie.llm import attack_map, cmd_parser, downloader, factkeys, scp
+from cowrie.llm import attack_map, cmd_parser, cmdchain, downloader, factkeys, scp
 from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
@@ -184,6 +184,79 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         log.msg(eventid="cowrie.command.input", input=string, format="CMD: %(input)s")
         self._emit_attack_techniques(string)
 
+        # A chained line (`cd /tmp && wget X`) is several commands. Before
+        # this split, the fastpath took the first whitespace token and threw
+        # the remainder away — putting the whole string into the prompt and
+        # silently discarding the payload fetch.
+        segments = cmdchain.split_chain(string)
+        if segments is not None and len(segments) > 1:
+            self._dispatch_chain(segments)
+            return
+
+        self._dispatch_one(string)
+
+    def _dispatch_chain(self, segments: list[tuple[str, str]]) -> None:
+        """Run a `;`/`&&`/`||` chain with real conditional semantics.
+
+        Two things make this more than a loop.
+
+        Conditionals are honoured, so `cd /tmp || cd /var/run || cd /`
+        runs only the first segment — exactly as bash would. Running all
+        three would silently relocate the attacker and be its own tell.
+
+        Local segments run in order until one needs the model; at that
+        point the *rest of the line* is handed over as a single prompt.
+        The model path is asynchronous, so sequencing further segments
+        after it would mean chaining deferreds through the ladder for a
+        case that is rare and that the model narrates coherently anyway.
+        """
+        succeeded = True
+        for index, (operator, command) in enumerate(segments):
+            if not cmdchain.should_run(operator, succeeded):
+                succeeded = True  # a skipped segment is not a failure
+                continue
+            # Suppress for every segment, including the last, and draw
+            # exactly one prompt below. Letting the final segment's handler
+            # draw its own produced a doubled prompt whenever the chain
+            # ended in a handled command — itself a tell.
+            self._suppress_prompt = True
+            try:
+                handled, succeeded = self._dispatch_local(command)
+            finally:
+                self._suppress_prompt = False
+            if not handled:
+                # Hand this segment and everything after it to the model
+                # as one line, preserving order without async sequencing.
+                remainder = command
+                for op, cmd in segments[index + 1 :]:
+                    remainder += f" {op} {cmd}"
+                self._apply_input_mutations(remainder)
+                self._process_command_with_llm(remainder)
+                return
+        self._show_prompt()
+
+    def _dispatch_local(self, command: str) -> tuple[bool, bool]:
+        """Try the synchronous ladder stages. Returns (handled, succeeded).
+
+        ``succeeded`` drives `&&` / `||` and is the emulator's notion of an
+        exit status: an error-shaped deterministic render counts as
+        failure, everything else as success.
+        """
+        if self._try_fastpath(command):
+            return True, True
+        self._apply_input_mutations(command)
+        result = respondermod.respond(command, self._shell_context())
+        if result is not None:
+            self._emit_deterministic(command, result)
+            return True, not result.is_error
+        if self._try_interactive(command):
+            return True, True
+        if self._try_download_intercept(command):
+            return True, True
+        return False, True
+
+    def _dispatch_one(self, string: str) -> None:
+        """The single-command ladder."""
         if self._try_fastpath(string):
             return
         # Parse the attacker's input for filesystem / env mutations and
@@ -361,6 +434,15 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         result = respondermod.respond(command, ctx)
         if result is None:
             return False
+        self._emit_deterministic(command, result)
+        return True
+
+    def _emit_deterministic(self, command, result) -> None:
+        """Write a deterministic render, draw the prompt, record the fact.
+
+        Split out of _try_deterministic so the chain dispatcher can reuse
+        it without duplicating the logging and ledger bookkeeping.
+        """
         # Count toward neither the LLM budget nor the LLM history — these
         # are pure local renders. They are derived from facts already in
         # the persona/WorldState, so the LLM stays consistent with them.
@@ -379,7 +461,6 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # Strictly after the write and the prompt: recording is bookkeeping,
         # and a bug in it must never cost the attacker their output.
         self._record_claim(command, result.output, source="deterministic")
-        return True
 
     def _record_usage(self, usage: dict) -> None:
         """Accumulate this turn's real token spend.
@@ -458,6 +539,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 excerpt=answer,
                 turn=getattr(self, "_command_count", 0),
                 source=source,
+                command=command.strip(),
             )
         except Exception as e:
             # Swallowed so a ledger bug can never break a live session —
@@ -564,6 +646,21 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         if intent is None:
             return False
 
+        # Record the *attempt*, not just the outcome. Everything below is
+        # asynchronous, so a fetch that never completes — network down,
+        # SSRF gate refusal, timeout — previously left no trace at all,
+        # and an operator reading the logs could not tell "the attacker
+        # never fetched anything" from "the attacker fetched and we lost
+        # it". Found by scripts/probe_search.py.
+        log.msg(
+            eventid="cowrie.llm.download_intercept",
+            input=command,
+            url=intent.url,
+            outfile=intent.outfile or "",
+            sessionno=f"S{self.sessionno}",
+            format="download intercept: %(url)s",
+        )
+
         def on_result(result):
             # Persist the captured file into WorldState so the next `ls
             # /tmp` etc. from the LLM sees it. Only "real" outcomes
@@ -611,6 +708,16 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         if not stripped:
             self._show_prompt(jitter_min, jitter_max)
             return True
+
+        # The defect this guard closes: the fastpath used to dispatch on
+        # the first whitespace token and hand the remainder to _handle_cd,
+        # which accepts anything starting with "/" as a directory. So
+        # `cd /tmp || cd /` put the entire string into the prompt, and
+        # `cd /tmp && wget X` dropped the fetch before the interceptor ran.
+        # responder._METACHARS already had the right operator list; this
+        # path simply never consulted it.
+        if not cmdchain.is_simple(stripped):
+            return False
 
         parts = stripped.split(None, 1)
         head = parts[0]
@@ -946,6 +1053,10 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         Zero values (the default) make this a no-op for the LLM-path
         callers, which are already slow.
         """
+        # Intermediate segments of a chained line must not each draw a
+        # prompt; the chain dispatcher draws one at the end.
+        if getattr(self, "_suppress_prompt", False):
+            return
         max_jitter = max(0, jitter_max_ms)
         min_jitter = max(0, min(jitter_min_ms, max_jitter))
         if max_jitter > 0:

