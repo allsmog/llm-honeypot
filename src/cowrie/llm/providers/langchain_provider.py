@@ -31,6 +31,9 @@ it.
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from twisted.internet import reactor
@@ -106,7 +109,55 @@ class LangChainProvider(LLMProvider):
         self._model = config.get("llm", "langchain_model", fallback="") or config.get(
             "llm", "model", fallback=""
         )
+        self._base_url = config.get("llm", "langchain_base_url", fallback="")
+        self._token_file = config.get("llm", "langchain_token_file", fallback="")
+        self._token_json_path = config.get(
+            "llm", "langchain_token_json_path", fallback="tokens.access_token"
+        )
+        self._api_key = config.get("llm", "langchain_api_key", fallback="")
+        # The Codex-over-ChatGPT endpoint rejects requests unless store is
+        # false and stream is true, and refuses system-role messages
+        # outright — system content has to travel as `instructions`. Those
+        # three are exactly what these switches exist for; a stock OpenAI or
+        # Ollama endpoint wants none of them.
+        self._responses_api = config.getboolean(
+            "llm", "langchain_responses_api", fallback=False
+        )
+        self._store = config.getboolean("llm", "langchain_store", fallback=True)
+        self._force_stream = config.getboolean(
+            "llm", "langchain_force_stream", fallback=False
+        )
+        self._system_as_instructions = config.getboolean(
+            "llm", "langchain_system_as_instructions", fallback=False
+        )
         self._chat: Any | None = None
+
+    def _load_token(self) -> str:
+        """Read a bearer token out of a JSON credential file.
+
+        Lets the provider reuse an OAuth session another tool already
+        established — the Codex CLI's ~/.codex/auth.json, for instance —
+        rather than requiring a separate API key. Re-read on each use so a
+        refreshed token is picked up without a restart.
+        """
+        if not self._token_file:
+            return self._api_key
+        path = Path(os.path.expanduser(self._token_file))
+        if not path.is_file():
+            return self._api_key
+        try:
+            node: Any = json.loads(path.read_text())
+            for part in self._token_json_path.split("."):
+                node = node[part]
+            return str(node) if node else self._api_key
+        except Exception as e:
+            log.msg(
+                eventid="cowrie.llm.error",
+                provider=self.name,
+                error=f"could not read token from {path}: {e}"[:200],
+                format="LLM[%(provider)s] %(error)s",
+            )
+            return self._api_key
 
     # -- abstract surface -------------------------------------------------
     # Satisfied for concreteness; LangChain owns transport, so there is no
@@ -153,11 +204,25 @@ class LangChainProvider(LLMProvider):
         """
         if self._chat is None:
             init_chat_model = _import_init_chat_model()
-            self._chat = init_chat_model(
-                self._model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-            )
+            kwargs: dict[str, Any] = {}
+            if self._base_url:
+                kwargs["base_url"] = self._base_url
+            token = self._load_token()
+            if token:
+                kwargs["api_key"] = token
+            if self._responses_api:
+                kwargs["use_responses_api"] = True
+            if not self._store:
+                kwargs["store"] = False
+            if self._force_stream:
+                kwargs["streaming"] = True
+            else:
+                # Endpoints that mandate streaming also reject the sampling
+                # and length knobs, so only send those where they are
+                # actually honoured.
+                kwargs["max_tokens"] = self.max_tokens
+                kwargs["temperature"] = self.temperature
+            self._chat = init_chat_model(self._model, **kwargs)
         return self._chat
 
     def _to_messages(self, request: LLMRequest) -> list:
@@ -167,12 +232,26 @@ class LangChainProvider(LLMProvider):
         # protocol only ever fills system_blocks, so reading `system`
         # directly would send no persona at all.
         system = request.system_text()
-        if system:
+        if system and not self._system_as_instructions:
             messages.append(SystemMessage(content=system))
         for m in request.messages:
             cls = HumanMessage if m.role == "user" else AIMessage
             messages.append(cls(content=m.content))
         return messages
+
+    def _bound_model(self, request: LLMRequest):
+        """The chat model, with any per-request parameters attached.
+
+        The honeypot's system prompt changes every turn as WorldState
+        mutates, so on endpoints that take system content as `instructions`
+        it cannot be fixed at construction — .bind() supplies it per call.
+        """
+        chat = self._chat_model()
+        if self._system_as_instructions:
+            system = request.system_text()
+            if system:
+                return chat.bind(instructions=system)
+        return chat
 
     def _normalize_usage(self, usage: dict) -> dict[str, int]:
         """LangChain normalizes across backends into usage_metadata.
@@ -223,7 +302,7 @@ class LangChainProvider(LLMProvider):
         return str(content or "")
 
     def _invoke(self, request: LLMRequest) -> str:
-        message = self._chat_model().invoke(self._to_messages(request))
+        message = self._bound_model(request).invoke(self._to_messages(request))
         self._capture(message, request)
         return self._text_of(message)
 
@@ -255,7 +334,7 @@ class LangChainProvider(LLMProvider):
         callFromThread."""
         parts: list[str] = []
         last = None
-        for chunk in self._chat_model().stream(self._to_messages(request)):
+        for chunk in self._bound_model(request).stream(self._to_messages(request)):
             last = chunk
             text = self._text_of(chunk)
             if text:

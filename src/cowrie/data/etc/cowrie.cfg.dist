@@ -422,6 +422,60 @@ log_raw = false
 # (default: empty)
 #langchain_model = ollama:llama3.1
 
+# Point LangChain at a non-standard endpoint. Needed to reuse an OAuth
+# session another tool already established rather than a separate API key.
+# Verified working against the Codex-over-ChatGPT backend:
+#
+#   provider = langchain
+#   langchain_model = openai:gpt-5.4
+#   langchain_base_url = https://chatgpt.com/backend-api/codex
+#   langchain_token_file = ~/.codex/auth.json
+#   langchain_responses_api = true
+#   langchain_store = false
+#   langchain_force_stream = true
+#   langchain_system_as_instructions = true
+#
+# The four switches below exist because that endpoint is stricter than the
+# OpenAI platform API: it refuses system-role messages ("System messages
+# are not allowed"), demands store=false and stream=true, and rejects the
+# usual length/sampling parameters. A stock OpenAI or Ollama endpoint wants
+# none of them, which is why every one defaults off.
+# (default: empty)
+#langchain_base_url = https://chatgpt.com/backend-api/codex
+
+# Read the bearer token from a JSON credential file instead of configuring
+# a key here. Re-read per request, so a refreshed OAuth token is picked up
+# without restarting the honeypot. langchain_token_json_path is the
+# dotted path to the token within that file.
+# (defaults: empty, tokens.access_token)
+#langchain_token_file = ~/.codex/auth.json
+#langchain_token_json_path = tokens.access_token
+
+# Bearer token supplied inline, if you would rather not use a file.
+# (default: empty)
+#langchain_api_key =
+
+# Use the Responses API rather than chat-completions.
+# (default: false)
+#langchain_responses_api = false
+
+# Whether the endpoint may persist the conversation. The Codex backend
+# rejects the request outright unless this is false.
+# (default: true)
+#langchain_store = true
+
+# Force streaming, and stop sending max_tokens/temperature. Endpoints that
+# mandate streaming generally reject those knobs too, so the two travel
+# together.
+# (default: false)
+#langchain_force_stream = false
+
+# Send system content as the Responses API `instructions` field instead of
+# a system-role message. Supplied per turn via .bind(), since the
+# honeypot's system prompt changes as WorldState mutates.
+# (default: false)
+#langchain_system_as_instructions = false
+
 # Wall-clock ceiling on a single upstream call, in seconds. 0 disables it.
 # Without a ceiling, a backend that accepts the connection and then stalls
 # holds the session open until [honeypot] interactive_timeout reaps it —

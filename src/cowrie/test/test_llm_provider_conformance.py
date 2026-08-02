@@ -34,7 +34,7 @@ from twisted.internet import defer
 from twisted.trial import unittest
 
 from cowrie.llm.providers import ProviderRegistry
-from cowrie.llm.providers.base import LLMMessage, LLMRequest
+from cowrie.llm.providers.base import LLMMessage, LLMProvider, LLMRequest
 from cowrie.test.test_llm_providers import StubAgent
 
 #: Credentials for every provider, so construction succeeds and the test
@@ -115,6 +115,22 @@ def _providers():
     return out
 
 
+def _http_providers(providers):
+    """Those driven through the base class's HTTP path.
+
+    A provider that overrides ``generate`` owns its own transport and never
+    touches ``provider.agent`` — the LangChain one delegates to a library.
+    Swapping in an HTTP stub tells you nothing about it, so the
+    request/response assertions below skip it and its own test module
+    covers the same contract with an injected fake chat model.
+    """
+    return [
+        (name, p)
+        for name, p in providers
+        if type(p).generate is LLMProvider.generate
+    ]
+
+
 class TestProviderConformance(unittest.TestCase):
     def setUp(self):
         self.providers = _providers()
@@ -149,7 +165,7 @@ class TestProviderConformance(unittest.TestCase):
         the time generate() returns.
         """
         pending = []
-        for name, provider in self.providers:
+        for name, provider in _http_providers(self.providers):
             provider.agent = StubAgent(status=500, body=b'{"error":"boom"}')
             pending.append(
                 provider.generate(_request()).addCallback(
@@ -168,7 +184,7 @@ class TestProviderConformance(unittest.TestCase):
         """Without this, cost telemetry logs zeros forever and a token cap
         cannot fire — and nothing distinguishes 'free' from 'unmeasured'."""
         pending = []
-        for name, provider in self.providers:
+        for name, provider in _http_providers(self.providers):
             requests = []
             for body in _CANNED_BODIES:
                 provider.agent = StubAgent(status=200, body=body)
