@@ -100,7 +100,7 @@ SPDX-FileCopyrightText = "2021-2026 Michel Oosterhof <michel@oosterhof.net>"
 SPDX-License-Identifier = "BSD-3-Clause"
 
 [[annotations]]
-path = ["src/cowrie/llm/**", "src/cowrie/test/test_llm_*.py", "src/cowrie/scripts/minimax_bench.py", "scripts/attacker_sim.py", "scripts/fidelity_eval.py", "scripts/planner_diff.py", "README.md", "DEPLOY.md"]
+path = ["src/cowrie/llm/**", "src/cowrie/test/test_llm_*.py", "scripts/attacker_sim.py", "scripts/fidelity_eval.py", "scripts/routing_report.py", "README.md", "DEPLOY.md"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2025-2026 Michel Oosterhof <michel@oosterhof.net>"
 SPDX-License-Identifier = "BSD-3-Clause"

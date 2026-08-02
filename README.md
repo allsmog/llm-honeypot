@@ -444,23 +444,45 @@ coverage report --include='*/cowrie/llm/*'
   providers are fully async and have no such ceiling. Measure before
   pointing a busy sensor at it. It is also a large transitive dependency
   tree on an internet-facing host, which is why it is an optional extra.
-- **The minimax response planner is present but not wired in.**
-  `cowrie/llm/planner/` implements a depth-limited minimax search over
-  response policies, with alpha-beta pruning proven equivalent to a plain
-  minimax oracle (`test_llm_minimax_equivalence.py`: exact value and
-  root-move agreement over 150 seeded states × depths 1-4, with per-pair
-  node dominance; `minimax-bench` reports ~13x fewer nodes with move
-  ordering). Nothing in the response path imports it, so it changes no
-  behavior. It is unwired because `scripts/planner_diff.py` — which
-  replays the `attacker_sim` patterns through the real responder/download
-  probes — showed the planner **reproduces the existing if-ladder's
-  decision on every one of the 67 decidable commands**, and that depth-1
-  greedy matches depth-4 search exactly on all of them. On recon-heavy
-  traffic the if-ladder is already near-optimal, so there is nothing for a
-  search to improve; its `planner_depth` is unjustified until some future
-  state (token pressure, re-probe risk, accumulated safety signals) gives
-  lookahead something to discriminate on. Treat it as a tested algorithm
-  awaiting a problem, not a shipped feature.
+## What we tried that did not work
+
+**A minimax response planner.** We built a depth-limited minimax search
+over eight response policies — MAX picks how the honeypot answers, MIN
+picks the attacker's most damaging follow-up — with alpha-beta pruning
+proven equivalent to a plain minimax oracle (exact value and root-move
+agreement over 150 seeded states × depths 1–4, per-pair node dominance,
+2162 → 216 nodes at depth 4 with move ordering). It is preserved at the
+`minimax-planner-v1` tag and removed from the tree. `git revert` of the
+removal commit restores it whole.
+
+It was removed because measurement, not opinion, said it had no job:
+
+- **It reproduced the if-ladder's decision on 100% of commands**, and
+  depth-1 greedy matched depth-4 search exactly. On recon-heavy traffic
+  the ladder is already near-optimal — pick the emulator when it can
+  answer, the model when it cannot — so there was nothing to improve.
+- **Where lookahead did diverge, it was wrong.** Over 3,000
+  runtime-reachable states, 96% of divergence moved *away* from answering
+  with the model — 60% of it toward emitting nothing at all. A worst-case
+  MIN always plays the most damaging reply, so deep search learns "never
+  speak," which is the inversion of a honeypot's purpose.
+- **Expectimax, the textbook correction, made it worse.** Replacing the
+  adversarial MIN with an expectation over an attacker prior *reduced*
+  depth-4-vs-greedy divergence from 4.9% to 1.1%. It works by removing the
+  punishment that was the only thing lookahead reacted to.
+- **There is no prior to build that on.** All 34 sessions in our logs
+  originate from `127.0.0.1`; they are `attacker_sim` talking to itself,
+  and the 62 distinct commands in the logs are the 62 written into that
+  file. Any distribution derived from them restates a fixture.
+
+Two justifications we previously recorded for keeping it are false, and
+worth correcting explicitly: accumulated safety signals cannot influence
+the search (they are constant within a single search by construction), and
+token pressure correlates *inversely* with divergence.
+
+What survived is `scripts/routing_report.py`, the measurement built to
+evaluate the planner. It found the piped-command gap that became this
+week's most valuable fix, and now gates against that regressing.
 
 ## Known security caveats
 
