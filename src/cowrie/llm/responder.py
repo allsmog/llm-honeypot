@@ -84,7 +84,15 @@ class ResponderResult:
     # True when `output` is really stderr — "No such file or directory"
     # and friends. On a real box that text never traverses a pipe, so the
     # pipeline path declines rather than filtering it.
+    #
+    # This is a *stream* flag, not an exit status: it answers "does this
+    # text go down the pipe", which is why `exit_code` is separate. The two
+    # correlate but are not the same axis — `grep` finding nothing exits 1
+    # with empty stdout and no stderr at all.
     is_error: bool = False
+    # Shell exit status. Drives `&&` / `||`. Nonzero on any failure,
+    # whether or not the failure text is stderr-shaped.
+    exit_code: int = 0
     # Set when we recognized an interactive/full-screen command we choose
     # not to emulate deterministically (vim, bare top, ...). The caller may
     # use this to enrich the LLM hint. We still return None from respond()
@@ -497,17 +505,32 @@ def _h_uptime(args, ctx, user):
 # /proc and /etc files (via cat)
 
 
+def _cpu_identity(persona) -> tuple[str, str, str, str]:
+    """(vendor_id, cpu family, model, stepping) implied by the model name.
+
+    These were hardcoded to Intel's values while the persona's model name
+    was free to say anything, so the Alpine box advertised
+    ``vendor_id: GenuineIntel`` three lines above
+    ``model name: AMD EPYC 7763``. One `cat /proc/cpuinfo` showed both — a
+    single-command contradiction, no cross-referencing needed.
+    """
+    if "AMD" in persona.cpuinfo_model:
+        return "AuthenticAMD", "25", "1", "1"
+    return "GenuineIntel", "6", "85", "7"
+
+
 def _proc_cpuinfo(ctx) -> str:
     p = ctx.persona
+    vendor, family, model, stepping = _cpu_identity(p)
     blocks = []
     for n in range(p.ncpus):
         blocks.append(
             f"processor\t: {n}\n"
-            f"vendor_id\t: GenuineIntel\n"
-            f"cpu family\t: 6\n"
-            f"model\t\t: 85\n"
+            f"vendor_id\t: {vendor}\n"
+            f"cpu family\t: {family}\n"
+            f"model\t\t: {model}\n"
             f"model name\t: {p.cpuinfo_model}\n"
-            f"stepping\t: 7\n"
+            f"stepping\t: {stepping}\n"
             f"microcode\t: 0x1\n"
             f"cpu MHz\t\t: {p.cpu_mhz:.3f}\n"
             f"cache size\t: 16384 KB\n"
@@ -710,7 +733,9 @@ def _etc_group(ctx) -> str:
 def _etc_shadow(ctx, user) -> ResponderResult:
     if user != "root":
         return ResponderResult(
-            output="cat: /etc/shadow: Permission denied\n", is_error=True
+            output="cat: /etc/shadow: Permission denied\n",
+            is_error=True,
+            exit_code=1,
         )
     lines = [
         "root:$6$rounds=656000$abcdefgh$0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789AbCdEfGhIjKlMnOpQrStUvWxYz012345:19000:0:99999:7:::",
@@ -802,6 +827,7 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
             return ResponderResult(
                 output=f"cat: {path}: No such file or directory\n",
                 is_error=True,
+                exit_code=1,
             )
         major = "12.7" if "12" in p.distro else (
             "11.11" if "Debian" in p.distro else
@@ -818,6 +844,7 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
             return ResponderResult(
                 output=f"cat: {path}: No such file or directory\n",
                 is_error=True,
+                exit_code=1,
             )
         return ResponderResult(output=f"{p.distro}\n")
     if path == "/etc/alpine-release":
@@ -825,6 +852,7 @@ def _cat_one(path: str, ctx, user) -> ResponderResult | None:
             return ResponderResult(
                 output=f"cat: {path}: No such file or directory\n",
                 is_error=True,
+                exit_code=1,
             )
         return ResponderResult(output=p.distro.replace("Alpine Linux v", "") + ".0\n")
     if path in table:
@@ -887,6 +915,7 @@ def _h_lsb_release(args, ctx, user):
 
 def _h_lscpu(args, ctx, user):
     p = ctx.persona
+    vendor, family, model, _stepping = _cpu_identity(p)
     return ResponderResult(
         output=(
             "Architecture:                       x86_64\n"
@@ -894,10 +923,10 @@ def _h_lscpu(args, ctx, user):
             "Byte Order:                         Little Endian\n"
             f"CPU(s):                             {p.ncpus}\n"
             f"On-line CPU(s) list:                0{'-' + str(p.ncpus - 1) if p.ncpus > 1 else ''}\n"
-            "Vendor ID:                          GenuineIntel\n"
+            f"Vendor ID:                          {vendor}\n"
             f"Model name:                         {p.cpuinfo_model}\n"
-            "CPU family:                         6\n"
-            "Model:                              85\n"
+            f"CPU family:                         {family}\n"
+            f"Model:                              {model}\n"
             f"Thread(s) per core:                 1\n"
             f"Core(s) per socket:                 {p.ncpus}\n"
             "Socket(s):                          1\n"
@@ -1098,28 +1127,73 @@ def _strftime_from_date(fmt: str) -> str:
     return fmt
 
 
+# Binaries every persona has: coreutils/util-linux on the glibc distros,
+# busybox applets on Alpine.
+_CORE_BINS = {
+    "ls", "cat", "echo", "sh", "cp", "mv", "rm", "ps", "grep",
+    "awk", "sed", "cut", "sort", "head", "tail", "wc", "find", "chmod",
+    "chown", "kill", "id", "whoami", "uname", "df", "du", "free", "top",
+    "tar", "gzip", "date", "env", "which", "sleep",
+}
+
+# Binaries that arrive with a package. Mapping binary -> package names that
+# provide it; a persona installing none of them does not have the binary.
+#
+# This used to be one flat set, so `which` vouched for git, vim, perl and
+# rsync on the Alpine persona, whose package list contains none of them —
+# and `dpkg -l` / `apk info` would say so. busybox provides trimmed-down
+# applets for several of these, which is why it appears as a provider.
+_PKG_BINS = {
+    "curl": ("curl",),
+    "wget": ("wget",),
+    "python3": ("python3",),
+    "python": ("python3",),
+    "git": ("git",),
+    "vim": ("vim", "vim-tiny"),
+    "vi": ("vim", "vim-tiny", "busybox"),
+    "nano": ("nano",),
+    "perl": ("perl",),
+    "nc": ("netcat", "netcat-openbsd", "busybox"),
+    "ping": ("iputils-ping", "iputils", "busybox"),
+    "rsync": ("rsync",),
+    "openssl": ("openssl",),
+    "ip": ("iproute2", "busybox"),
+    "ssh": ("openssh-client", "openssh-server", "openssh"),
+    "scp": ("openssh-client", "openssh-server", "openssh"),
+}
+
+
+def _which_path(name: str, ctx) -> str | None:
+    """Where ``name`` lives on this persona, or None if it is not installed."""
+    p = ctx.persona
+    if name == "bash":
+        # The persona decides whether this box even has bash; Alpine ships
+        # busybox ash and leaves bash_version empty.
+        return "/usr/bin/bash" if p.bash_version else None
+    if name in _CORE_BINS:
+        # Alpine's busybox applets are real files in /bin; the glibc distros
+        # are usr-merged, so `which` reports /usr/bin.
+        return f"/bin/{name}" if p.family == "alpine" else f"/usr/bin/{name}"
+    providers = _PKG_BINS.get(name)
+    if providers and any(pkg in p.installed_packages for pkg in providers):
+        return f"/usr/bin/{name}"
+    return None
+
+
 def _h_which(args, ctx, user):
     positional = [a for a in args if not a.startswith("-")]
     if not positional:
         return None
-    known_bins = {
-        "ls", "cat", "echo", "sh", "bash", "cp", "mv", "rm", "ps", "grep",
-        "awk", "sed", "cut", "sort", "head", "tail", "wc", "find", "chmod",
-        "chown", "kill", "id", "whoami", "uname", "df", "du", "free", "top",
-        "ssh", "scp", "tar", "gzip", "date", "env", "which", "sleep",
-    }
-    pkg_bins = {
-        "curl", "wget", "python3", "python", "git", "vim", "vi", "nano",
-        "perl", "nc", "ping", "rsync", "openssl", "ip",
-    }
-    avail = known_bins | pkg_bins
-    out_lines = []
-    for name in positional:
-        if name in avail:
-            out_lines.append(f"/usr/bin/{name}")
-    if not out_lines:
-        # which prints nothing and exits 1; produce no stdout.
-        return ResponderResult(output="")
+    out_lines = [
+        path for path in (_which_path(n, ctx) for n in positional) if path
+    ]
+    if len(out_lines) < len(positional):
+        # `which` exits nonzero if *any* argument was not found, and prints
+        # only the ones that were.
+        return ResponderResult(
+            output=("\n".join(out_lines) + "\n") if out_lines else "",
+            exit_code=1,
+        )
     return ResponderResult(output="\n".join(out_lines) + "\n")
 
 
@@ -1449,7 +1523,8 @@ def _h_stat(args, ctx, user):
         return None
     # "cannot statx ..." is stderr on a real box; flag it so a pipeline
     # declines rather than grepping an error message.
-    return ResponderResult(output=out, is_error=out.startswith("stat: cannot"))
+    failed = out.startswith("stat: cannot")
+    return ResponderResult(output=out, is_error=failed, exit_code=1 if failed else 0)
 
 
 # ----------------------------------------------------------------------

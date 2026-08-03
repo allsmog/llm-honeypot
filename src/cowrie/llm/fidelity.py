@@ -196,6 +196,48 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
         f"{nproc} vs {block_count}",
     )
 
+    # CPU vendor agrees with the model name, in cpuinfo and in lscpu.
+    # These were hardcoded to Intel's values while the persona's model name
+    # was free to say anything, so the Alpine box printed
+    # "vendor_id: GenuineIntel" three lines above "model name: AMD EPYC
+    # 7763" — a contradiction inside a single command's output, which the
+    # 26 invariants above all missed because none of them read two fields
+    # of the same file against each other.
+    expect_vendor = "AuthenticAMD" if "AMD" in p.cpuinfo_model else "GenuineIntel"
+    check(
+        "cpuinfo vendor_id matches model name",
+        f"vendor_id\t: {expect_vendor}" in cpuinfo,
+        f"expected {expect_vendor} for {p.cpuinfo_model}",
+    )
+    lscpu = _out(ctx, "lscpu") or ""
+    check(
+        "lscpu vendor agrees with cpuinfo",
+        expect_vendor in lscpu,
+        f"expected {expect_vendor} in lscpu",
+    )
+    check(
+        "lscpu model name agrees with cpuinfo",
+        p.cpuinfo_model in lscpu and p.cpuinfo_model in cpuinfo,
+    )
+
+    # `which` must not vouch for binaries this persona does not install.
+    # It used to answer from one flat set, so the Alpine persona — which
+    # ships busybox and no bash — reported /usr/bin/bash, and vouched for
+    # git, vim, perl and rsync that its own package list omits.
+    which_bash = _out(ctx, "which bash")
+    check(
+        "which bash agrees with persona shell",
+        bool(which_bash and which_bash.strip()) == bool(p.bash_version),
+        f"bash_version={p.bash_version!r} but which said {which_bash!r}",
+    )
+    for binary, package in (("git", "git"), ("rsync", "rsync"), ("perl", "perl")):
+        got = (_out(ctx, f"which {binary}") or "").strip()
+        check(
+            f"which {binary} agrees with installed packages",
+            bool(got) == (package in p.installed_packages),
+            f"{binary}: which={got!r}, installed={package in p.installed_packages}",
+        )
+
     # free total == /proc/meminfo MemTotal == persona memtotal.
     meminfo = _out(ctx, "cat /proc/meminfo") or ""
     check(

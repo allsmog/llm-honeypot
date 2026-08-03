@@ -159,6 +159,40 @@ class VFS:
         return any(n.name == name and n.kind == "dir"
                    for n in self.skeleton.get(parent, []))
 
+    def path_status(self, path: str) -> str:
+        """Three-way existence: "dir", "file", "absent", or "unknown".
+
+        ``is_dir`` collapses "we model this and it is not a directory" with
+        "we do not model this at all", which is exactly the distinction a
+        caller like ``cd`` needs: the first must fail, the second must be
+        accepted so we never contradict the model on a path we never
+        described.
+
+        "absent" is only returned when the *parent* is modelled, because
+        then our own `ls` of that parent already enumerated its contents.
+        Answering anything else would contradict a listing we just gave —
+        `ls /etc` showing 12 entries and `cd /etc/apache2` succeeding is a
+        contradiction between two commands, which is the class of tell the
+        fidelity harness exists to catch.
+        """
+        path = _normpath(path)
+        if path in self.skeleton:
+            return "dir"
+        if path in self.world.files:
+            return "file"
+        parent, name = _split(path)
+        for node in self.skeleton.get(parent, []):
+            if node.name == name:
+                # A symlink to a directory is traversable; we do not model
+                # link targets deeply, so treat links as unknown rather
+                # than claiming they are or are not directories.
+                if node.kind == "link":
+                    return "unknown"
+                return "dir" if node.kind == "dir" else "file"
+        if parent in self.skeleton:
+            return "absent"
+        return "unknown"
+
 
 # ----------------------------------------------------------------------
 # Path helpers
