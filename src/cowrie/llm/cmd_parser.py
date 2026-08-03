@@ -37,6 +37,11 @@ class CmdMutation:
     env_value: str | None = None
     user: str | None = None        # for push_user (su/sudo target)
     proc_command: str | None = None  # for add_process (cmd &)
+    # The command that produced this intent. Carried so a refusal can be
+    # worded the way that command words it — `touch` and a `>` redirect
+    # both create a file but report failure completely differently, and
+    # the wording is exactly what a probe compares against a real box.
+    verb: str = ""
 
 
 # ----------------------------------------------------------------------
@@ -130,7 +135,9 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
         content = _strip_quotes(m.group("content"))
         path = m.group("path").strip("'\"")
         kind: MutationKind = "append_file" if m.group("op") == ">>" else "create_file"
-        mutations.append(CmdMutation(kind=kind, path=path, content=content))
+        mutations.append(
+            CmdMutation(kind=kind, path=path, content=content, verb="redirect")
+        )
         return mutations
 
     # touch ...
@@ -138,7 +145,11 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
     if m:
         for arg in _tokens(m.group("args")):
             if not arg.startswith("-"):
-                mutations.append(CmdMutation(kind="create_file", path=arg, content=""))
+                mutations.append(
+                    CmdMutation(
+                        kind="create_file", path=arg, content="", verb="touch"
+                    )
+                )
         return mutations
 
     # rm ...
@@ -146,7 +157,9 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
     if m:
         for arg in _tokens(m.group("args")):
             if not arg.startswith("-"):
-                mutations.append(CmdMutation(kind="remove_file", path=arg))
+                mutations.append(
+                    CmdMutation(kind="remove_file", path=arg, verb="rm")
+                )
         return mutations
 
     # cp src dst
@@ -155,7 +168,10 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
         positional = [a for a in _tokens(m.group("args")) if not a.startswith("-")]
         if len(positional) >= 2:
             mutations.append(
-                CmdMutation(kind="copy_file", path=positional[0], dst_path=positional[-1])
+                CmdMutation(
+                    kind="copy_file", path=positional[0],
+                    dst_path=positional[-1], verb="cp",
+                )
             )
         return mutations
 
@@ -165,7 +181,10 @@ def parse_input_mutations(line: str) -> list[CmdMutation]:
         positional = [a for a in _tokens(m.group("args")) if not a.startswith("-")]
         if len(positional) >= 2:
             mutations.append(
-                CmdMutation(kind="move_file", path=positional[0], dst_path=positional[-1])
+                CmdMutation(
+                    kind="move_file", path=positional[0],
+                    dst_path=positional[-1], verb="mv",
+                )
             )
         return mutations
 

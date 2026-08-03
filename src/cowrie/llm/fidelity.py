@@ -18,7 +18,9 @@ import subprocess
 from dataclasses import dataclass, field
 
 from cowrie.llm import responder as respondermod
+from cowrie.llm import vfs as vfsmod
 from cowrie.llm.persona import pick_persona, roll_boot_time
+from cowrie.llm.state import permissions as permsmod
 from cowrie.llm.worldstate import WorldState
 
 # ----------------------------------------------------------------------
@@ -219,6 +221,36 @@ def run_consistency(ctx: respondermod.ShellContext) -> list[CheckResult]:
         "lscpu model name agrees with cpuinfo",
         p.cpuinfo_model in lscpu and p.cpuinfo_model in cpuinfo,
     )
+
+    # What `ls` displays and what the shell enforces must agree.
+    #
+    # These are two different code paths over the same skeleton — the mode
+    # formatter in vfs.render_ls, and the permission triads in
+    # state.permissions — so this catches them drifting apart. The failure
+    # it guards against is visible in two commands: a directory rendered
+    # `drwxrwxrwt` that then refuses a write, or one rendered `drwx------`
+    # that accepts it.
+    listing = _out(ctx, "ls -la /") or ""
+    shown_modes: dict[str, str] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) >= 9 and parts[0].startswith("d"):
+            shown_modes[parts[-1]] = parts[0]
+    vfs = vfsmod.VFS(ctx.world, ctx.login_user)
+    for name in ("root", "tmp"):
+        shown = shown_modes.get(name)
+        if not shown or len(shown) < 9:
+            check(f"ls -la / lists {name}", False, "missing from listing")
+            continue
+        # Position 8 is the "other" write bit; the sticky dirs show `t`
+        # there in place of `x`, and `t` implies the write bit is set.
+        others_may_write = shown[8] in ("w", "t")
+        enforced = permsmod.can_write(vfs, f"/{name}", "nobody")
+        check(
+            f"ls mode for /{name} agrees with what is enforced",
+            enforced == others_may_write,
+            f"ls shows {shown}, enforcement says can_write={enforced}",
+        )
 
     # `which` must not vouch for binaries this persona does not install.
     # It used to answer from one flat set, so the Alpine persona — which

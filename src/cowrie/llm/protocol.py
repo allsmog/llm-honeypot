@@ -21,9 +21,11 @@ from cowrie.llm import interactive as interactivemod
 from cowrie.llm import persona as personamod
 from cowrie.llm import prompts as promptmod
 from cowrie.llm import responder as respondermod
+from cowrie.llm import state as statemod
 from cowrie.llm import vfs as vfsmod
 from cowrie.llm.llm import LLMClient
 from cowrie.llm.providers.base import LLMMessage, LLMRequest
+from cowrie.llm.state import permissions as permsmod
 from cowrie.llm.worldstate import WorldState
 
 
@@ -266,7 +268,11 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         handled, succeeded = self._try_fastpath(command)
         if handled:
             return True, succeeded
-        self._apply_input_mutations(command)
+        plan = self._plan_input_mutations(command)
+        if plan.refused:
+            self._emit_refusal(command, plan)
+            return True, False
+        self._commit_mutations(plan)
         result = respondermod.respond(command, self._shell_context())
         if result is not None:
             self._emit_deterministic(command, result)
@@ -282,12 +288,21 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         handled, _succeeded = self._try_fastpath(string)
         if handled:
             return
-        # Parse the attacker's input for filesystem / env mutations and
-        # apply them to WorldState BEFORE the LLM call — so the next
-        # turn's system prompt already reflects the change. The LLM
-        # still narrates the command's terminal output; WorldState just
-        # keeps the picture consistent across turns.
-        self._apply_input_mutations(string)
+        # Parse the attacker's input for filesystem / env mutations, check
+        # them against the world, and commit only if they are allowed. A
+        # refusal is rendered here and the ladder stops: we are the
+        # authority on whether a modelled mutation succeeded, not the
+        # model, which would otherwise be asked to narrate a write we had
+        # already recorded as having happened.
+        #
+        # Committing before the model call (rather than after) is still
+        # deliberate — the next turn's system prompt has to reflect the
+        # change — but it now happens only once the preconditions hold.
+        plan = self._plan_input_mutations(string)
+        if plan.refused:
+            self._emit_refusal(string, plan)
+            return
+        self._commit_mutations(plan)
         # Deterministic responder: identity/info commands (whoami, uname,
         # free, cat /etc/os-release, ps, ...) are rendered from the pinned
         # persona + WorldState instead of the LLM. Instant (no model round
@@ -485,6 +500,31 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         # and a bug in it must never cost the attacker their output.
         self._record_claim(command, result.output, source="deterministic")
 
+    def _emit_refusal(self, command, plan) -> None:
+        """Render a precondition failure the same way a real shell would.
+
+        Goes out on the same path as any other deterministic render — same
+        jitter, same prompt — because a refusal that arrived on a visibly
+        different schedule from a success would be its own tell.
+
+        Not recorded in the fact ledger: nothing was established about the
+        machine here, only that this command was not allowed to run.
+        """
+        log.msg(
+            eventid="cowrie.llm.refused",
+            input=command,
+            cwd=self.cwd,
+            reason=plan.stderr.strip(),
+            exit_code=plan.exit_code,
+            sessionno=f"S{self.sessionno}",
+            format="refused: %(input)s (%(reason)s)",
+        )
+        if self.terminal is not None and plan.stderr:
+            self.terminal.write(plan.stderr.encode("utf-8"))
+        jitter_min = CowrieConfig.getint("llm", "fastpath_jitter_ms_min", fallback=5)
+        jitter_max = CowrieConfig.getint("llm", "fastpath_jitter_ms_max", fallback=15)
+        self._show_prompt(jitter_min, jitter_max)
+
     def _record_usage(self, usage: dict) -> None:
         """Accumulate this turn's real token spend.
 
@@ -598,8 +638,36 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
             return str(world.effective_user(login_user))
         return login_user
 
-    def _apply_input_mutations(self, command: str) -> None:
-        for m in cmd_parser.parse_input_mutations(command):
+    def _plan_input_mutations(self, command: str):
+        """Validate what ``command`` intends to change, without changing it.
+
+        Returns a Plan. This is the half of the transaction that can say
+        no; ``_commit_mutations`` is the half that writes. Splitting them
+        is the point: mutations used to be applied straight from the parsed
+        input, before the responder or the model had established whether
+        the command was even allowed, so a refused write still left the
+        file in WorldState and the next `ls` listed it.
+        """
+        try:
+            mutations = cmd_parser.parse_input_mutations(command)
+            if not mutations:
+                return statemod.Plan()
+            vfs = vfsmod.VFS(self.world, str(self.user.username))
+            return statemod.plan_mutations(
+                mutations,
+                vfs,
+                user=self._effective_user(),
+                login_user=str(self.user.username),
+            )
+        except Exception:
+            # Never let planning wedge a session; an unvalidated commit is
+            # the old behaviour, which is survivable, and a traceback here
+            # would hang the shell until interactive_timeout.
+            return statemod.Plan()
+
+    def _commit_mutations(self, plan) -> None:
+        """Apply an already-validated plan to WorldState."""
+        for m in plan.mutations:
             if m.kind == "create_file":
                 self.world.add_file(
                     path=m.path or "",
@@ -817,7 +885,9 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         new_cwd = new_cwd.rstrip("/") or "/"
 
         status = self._cd_status(new_cwd)
-        if status in ("absent", "file"):
+        if status not in ("absent", "file") and not self._cd_permitted(new_cwd):
+            status = "denied"
+        if status in ("absent", "file", "denied"):
             if self.terminal is not None:
                 self.terminal.write(self._cd_error(arg, status).encode())
             self._show_prompt(jitter_min_ms, jitter_max_ms)
@@ -842,13 +912,37 @@ class HoneyPotBaseProtocol(insults.TerminalProtocol, TimeoutMixin):
         except Exception:
             return "unknown"
 
+    def _cd_permitted(self, path: str) -> bool:
+        """Whether the effective user may traverse into ``path``.
+
+        `ls -la /` renders /root as ``drwx------``, so a non-root session
+        walking into it would contradict a listing the attacker can read in
+        one command. Unmodelled paths permit, same as everywhere else.
+        """
+        world = getattr(self, "world", None)
+        if world is None:
+            return True
+        try:
+            vfs = vfsmod.VFS(world, str(self.user.username))
+            allowed = permsmod.can_traverse(vfs, path, self._effective_user())
+        except Exception:
+            return True
+        return allowed is not False
+
     def _cd_error(self, arg: str, status: str) -> str:
         """The shell's own wording — busybox ash and bash differ, and the
         persona already decides which shell this box runs."""
         persona = getattr(self, "persona", None)
+        if status == "denied":
+            reason = "Permission denied"
+        elif status == "file":
+            reason = "Not a directory"
+        else:
+            reason = "No such file or directory"
         if persona is not None and persona.family == "alpine":
+            if status == "denied":
+                return f"sh: cd: can't cd to {arg}: Permission denied\n"
             return f"sh: cd: can't cd to {arg}\n"
-        reason = "Not a directory" if status == "file" else "No such file or directory"
         return f"bash: cd: {arg}: {reason}\n"
 
     def _build_system_context(self, exec_command: str = "") -> str:

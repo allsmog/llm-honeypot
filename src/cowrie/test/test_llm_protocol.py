@@ -1086,3 +1086,158 @@ class TestChainedCommands(unittest.TestCase):
         self.assertEqual(
             tr.value().count(b"root@"), 0, "prompt drawn before the fetch resolved"
         )
+
+
+class TestTransactionalMutations(unittest.TestCase):
+    """Mutations used to be applied straight from the parsed input, before
+    anyone had established whether the command was allowed to run.
+
+    So a refused write still landed in WorldState, and the next `ls`
+    listed a file the shell had just said "Permission denied" to. The
+    world is now planned, validated, and committed only on success.
+
+    The governing invariant: a refused command leaves WorldState byte-for
+    byte unchanged.
+    """
+
+    def tearDown(self) -> None:
+        for proto in getattr(self, "_protos", []):
+            try:
+                proto.setTimeout(None)
+            except Exception:
+                pass
+
+    def _session(self, user="root", **kw):
+        proto, tr, stub = _make_protocol(**kw)
+        if user != "root":
+            proto.user.username = user
+        self._protos = getattr(self, "_protos", [])
+        self._protos.append(proto)
+        return proto, tr, stub
+
+    def _snapshot(self, proto):
+        return (
+            dict(proto.world.files),
+            dict(proto.world.env_vars),
+            list(proto.world.user_stack),
+            dict(proto.world.processes),
+        )
+
+    def _assert_unchanged(self, proto, before, line):
+        self.assertEqual(self._snapshot(proto), before, f"{line} mutated the world")
+
+    # -- permission ------------------------------------------------------
+
+    def test_non_root_write_to_root_is_denied_and_changes_nothing(self):
+        proto, tr, _ = self._session(user="phil")
+        before = self._snapshot(proto)
+        proto.lineReceived(b"echo secret > /root/private")
+        self.assertIn(b"Permission denied", tr.value())
+        self._assert_unchanged(proto, before, "echo > /root/private")
+
+    def test_root_may_write_where_others_may_not(self):
+        """The check must be a permission model, not a blanket refusal —
+        otherwise it is just a different wrong answer."""
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"echo secret > /root/private")
+        self.assertIn("/root/private", proto.world.files)
+
+    def test_world_writable_temp_dirs_still_accept_payloads(self):
+        """/tmp, /var/tmp and /dev/shm are 1777 on a real box and are where
+        payloads actually land. Refusing them would reject exactly what the
+        honeypot exists to capture."""
+        for path in ("/tmp/a", "/var/tmp/b", "/dev/shm/c"):
+            proto, _tr, _ = self._session(user="phil")
+            proto.lineReceived(f"touch {path}".encode())
+            self.assertIn(path, proto.world.files, f"{path} was refused")
+
+    # -- missing parents and sources -------------------------------------
+
+    def test_write_into_a_missing_directory_is_refused(self):
+        proto, tr, _ = self._session()
+        before = self._snapshot(proto)
+        proto.lineReceived(b"echo x > /nonexistent/f")
+        self.assertIn(b"No such file or directory", tr.value())
+        self._assert_unchanged(proto, before, "echo > /nonexistent/f")
+
+    def test_copy_from_a_missing_source_creates_no_destination(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"cp /tmp/missing /tmp/dst")
+        self.assertIn(b"cannot stat", tr.value())
+        self.assertNotIn("/tmp/dst", proto.world.files)
+
+    def test_move_from_a_missing_source_creates_no_destination(self):
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"mv /tmp/missing /tmp/dst")
+        self.assertIn(b"cannot stat", tr.value())
+        self.assertNotIn("/tmp/dst", proto.world.files)
+
+    # -- users -----------------------------------------------------------
+
+    def test_su_to_a_phantom_user_does_not_push_the_stack(self):
+        """A phantom name in user_stack shows up in the prompt and in
+        whoami, so this contradicts two commands at once."""
+        proto, tr, _ = self._session()
+        proto.lineReceived(b"su nosuchuser")
+        self.assertIn(b"does not exist", tr.value())
+        self.assertEqual(proto.world.user_stack, [])
+
+    def test_su_to_a_real_account_still_works(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"su www-data")
+        self.assertEqual(proto.world.user_stack, ["www-data"])
+
+    # -- wording ---------------------------------------------------------
+
+    def test_refusal_is_worded_by_the_command_that_failed(self):
+        """`touch` and a `>` redirect fail differently on a real box; the
+        redirect error comes from the shell and names no command."""
+        proto, tr, _ = self._session(user="phil")
+        proto.lineReceived(b"touch /root/x")
+        self.assertIn(b"touch: cannot touch '/root/x'", tr.value())
+
+        proto2, tr2, _ = self._session(user="phil")
+        proto2.lineReceived(b"echo y > /root/z")
+        self.assertIn(b"bash: /root/z: Permission denied", tr2.value())
+        self.assertNotIn(b"touch", tr2.value())
+
+    # -- the refusal must not reach the model ----------------------------
+
+    def test_a_refused_command_never_reaches_the_model(self):
+        """We are the authority on whether a modelled mutation happened.
+        Asking the model to narrate it would let it contradict us — and
+        cost a round trip to do so."""
+        proto, _tr, stub = self._session(user="phil")
+        proto.lineReceived(b"echo secret > /root/private")
+        self.assertEqual(len(stub.calls), 0)
+
+    def test_refusal_short_circuits_a_chain(self):
+        proto, _tr, _ = self._session(user="phil")
+        proto.lineReceived(b"echo secret > /root/private && touch /tmp/marker")
+        self.assertNotIn("/tmp/marker", proto.world.files)
+
+    # -- cd is subject to the same permission model ----------------------
+
+    def test_non_root_cannot_cd_into_root_home(self):
+        """`ls -la /` renders /root as drwx------, so walking into it as
+        another user contradicts a listing one command away."""
+        proto, tr, _ = self._session(user="phil")
+        proto.lineReceived(b"cd /root")
+        self.assertEqual(proto.cwd, "/")
+        self.assertIn(b"Permission denied", tr.value())
+
+    def test_root_can_cd_into_root_home(self):
+        proto, _tr, _ = self._session()
+        proto.lineReceived(b"cd /root")
+        self.assertEqual(proto.cwd, "/root")
+
+    def test_non_root_can_still_cd_into_world_readable_dirs(self):
+        for path in ("/tmp", "/etc"):
+            proto, _tr, _ = self._session(user="phil")
+            proto.lineReceived(f"cd {path}".encode())
+            self.assertEqual(proto.cwd, path)
+
+    def test_denied_cd_short_circuits_a_chain(self):
+        proto, _tr, _ = self._session(user="phil")
+        proto.lineReceived(b"cd /root && touch /tmp/marker")
+        self.assertNotIn("/tmp/marker", proto.world.files)

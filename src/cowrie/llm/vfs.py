@@ -32,6 +32,16 @@ class Node:
     mtime: float = 0.0
 
 
+# Modes for skeleton directories that no other skeleton entry lists, so
+# `node_for` has nowhere else to read them from. The sticky temp dirs are
+# the ones that matter: they are world-writable on a real box.
+_SKELETON_DIR_MODES: dict[str, int] = {
+    "/tmp": 0o1777,
+    "/var/tmp": 0o1777,
+    "/dev/shm": 0o1777,
+}
+
+
 # Canonical directory skeleton. Keys are absolute dir paths; values are the
 # entries directly inside them. Intentionally small and boring — a plausible,
 # lightly-used VPS, nothing that screams "lab". Dirs an attacker commonly
@@ -158,6 +168,37 @@ class VFS:
         parent, name = _split(path)
         return any(n.name == name and n.kind == "dir"
                    for n in self.skeleton.get(parent, []))
+
+    def node_for(self, path: str) -> Node | None:
+        """The Node describing ``path`` itself, or None if we do not model it.
+
+        ``_dir_entries`` answers "what is *inside* this path"; permission
+        checks need the mode and owner *of* the path, which is a different
+        question and lives one level up in the skeleton.
+        """
+        path = _normpath(path)
+        if path == "/":
+            # The root directory has no parent to be listed in.
+            return Node(name="/", kind="dir", mode=0o755, uid=0, gid=0)
+        parent, name = _split(path)
+        for node in self.skeleton.get(parent, []):
+            if node.name == name:
+                return node
+        if path in self.world.files:
+            fact = self.world.files[path]
+            uid = 0 if self.username == "root" else 1000
+            return Node(name=name, kind="file", size=fact.size_bytes,
+                        mode=0o644, uid=uid, gid=uid, mtime=fact.mtime)
+        if path in self.skeleton:
+            # A modelled directory whose parent we do not enumerate (e.g.
+            # /var/tmp, where /var is absent from the skeleton). Defaulting
+            # these to root-owned 0755 would quietly refuse writes to
+            # /var/tmp and /dev/shm — both world-writable on a real box and
+            # both common payload drops, so the honeypot would start
+            # rejecting exactly what it exists to capture.
+            return Node(name=name, kind="dir", mode=_SKELETON_DIR_MODES.get(path, 0o755),
+                        uid=0, gid=0)
+        return None
 
     def path_status(self, path: str) -> str:
         """Three-way existence: "dir", "file", "absent", or "unknown".

@@ -276,6 +276,27 @@ registry rather than naming providers.
   separate from `is_error`, which answers a different question — "is this
   text stderr", used to make the pipeline path decline. They correlate but
   are not the same axis.
+- **World mutations are transactional** (`cowrie/llm/state/`). Attacker
+  input is parsed into *intents*, validated against the world, and
+  committed only if the command is allowed to run — so a refused write
+  leaves WorldState byte-for-byte unchanged. Before this, mutations were
+  applied straight from the parsed input, so `echo secret > /root/private`
+  as a non-root user answered "Permission denied" and recorded the file
+  anyway, and the next `ls` listed it.
+
+  Validation is all-or-nothing per command: no shell half-applies. It
+  covers write permission, missing parent directories, missing `cp`/`mv`
+  sources, and `su` to an account `/etc/passwd` does not list. Refusals are
+  worded by the command that failed (`touch: cannot touch '…'` versus the
+  shell's own `bash: …`) and never reach the model — we are the authority
+  on whether a modelled mutation happened, and asking the model to narrate
+  one would let it contradict us.
+
+  Permissions read the same VFS nodes `ls` and `stat` render, so a
+  directory shown as `drwxrwxrwt` cannot then refuse a write. A fidelity
+  invariant cross-checks the two, since they are separate code paths.
+  Unmodelled paths are permitted throughout: inventing a restriction no
+  listing of ours supports is as detectable as inventing a permission.
 - **LLM-turn logging.** Every command emits `cowrie.llm.prompt` and
   `cowrie.llm.response` events to the JSON log with `latency_ms`. Errors
   log `cowrie.llm.error`. All carry the session id so they correlate with
@@ -358,7 +379,7 @@ deferral of anything not modeled.
 deterministic responder on the two believability axes the honeypot
 literature uses, and doubles as a CI regression gate:
 
-- **Consistency** — 33 cross-command / against-persona invariants that
+- **Consistency** — 35 cross-command / against-persona invariants that
   must hold (`uname -r` ⊂ `uname -a`, `nproc` == `/proc/cpuinfo` block
   count, `id www-data` == `/etc/passwd` uid 33, `hostname` ==
   `/etc/hostname`, `free` total == `/proc/meminfo` MemTotal, `/proc/meminfo`
