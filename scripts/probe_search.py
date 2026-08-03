@@ -343,11 +343,15 @@ def detect(session: Session, probe: str, output: str) -> list[Finding]:
 
 
 def build_alphabet() -> list[str]:
-    """~32 probes, each justified by an existing oracle or code branch.
+    """Probes justified by an existing oracle or code branch, in four
+    families: fastpath verbs by operators, re-probes, mutators, pipes.
 
     The first family is the important one: no other tool in this repo
     covers fastpath verbs carrying shell operators, which is precisely
     where the known bug lives.
+
+    The total is deliberately not written here — it drifted from the code
+    once already. `--sweep` prints the real count at run time.
     """
     fastpath_verbs = ("cd", "pwd", "clear", "exit")
     operators = ("&& id", "|| id", "; id")

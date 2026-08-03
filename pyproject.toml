@@ -288,6 +288,14 @@ legacy_tox_ini = """
         python {toxinidir}/scripts/fidelity_eval.py --persona ubuntu_22_04 --reference local
     basepython = python3.10
 
+    [testenv:probe]
+    description = adversarial detectability gate: no depth-1 command sequence may unmask the honeypot in any of the 96 behaviour configurations. Depth 2 is minutes-to-tens-of-minutes, so it is run manually or on a schedule, not per-push.
+    setenv =
+        PYTHONPATH = {toxinidir}/src
+    commands =
+        python {toxinidir}/scripts/probe_search.py --sweep --max-depth 1 --min-depth 1
+    basepython = python3.10
+
     [testenv:typing]
     description = run static type checkers
     extras =
