@@ -1,0 +1,752 @@
+{
+ "alpha": 1.0,
+ "counts": {
+  "audit_append": {
+   "chain_dispatch": {
+    "doubled": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "doubled": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "audit_cd_absent": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "entered": 6
+   }
+  },
+  "audit_interactive": {
+   "chain_dispatch": {
+    "local": 6
+   },
+   "downloader": {
+    "local": 6
+   },
+   "fact_ledger": {
+    "local": 6
+   },
+   "interactive": {
+    "model": 6
+   },
+   "no_fault": {
+    "local": 6
+   },
+   "persona": {
+    "local": 6
+   },
+   "transition_state": {
+    "local": 6
+   },
+   "vfs": {
+    "local": 6
+   }
+  },
+  "audit_ledger": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "empty": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "audit_refused_persist": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "leaked": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "download_path": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "chain_reorder": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fault": {
+   "": {
+    "chain_dispatch": 6,
+    "downloader": 6,
+    "fact_ledger": 6,
+    "interactive": 6,
+    "no_fault": 6,
+    "persona": 6,
+    "transition_state": 6,
+    "vfs": 6
+   }
+  },
+  "fid_fsperm": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fid_identity": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fid_kernel_cpu": {
+   "chain_dispatch\u001falpine": {
+    "ok": 1
+   },
+   "chain_dispatch\u001fdebian": {
+    "ok": 4
+   },
+   "chain_dispatch\u001frhel": {
+    "ok": 1
+   },
+   "downloader\u001falpine": {
+    "ok": 1
+   },
+   "downloader\u001fdebian": {
+    "ok": 4
+   },
+   "downloader\u001frhel": {
+    "ok": 1
+   },
+   "fact_ledger\u001falpine": {
+    "ok": 1
+   },
+   "fact_ledger\u001fdebian": {
+    "ok": 4
+   },
+   "fact_ledger\u001frhel": {
+    "ok": 1
+   },
+   "interactive\u001falpine": {
+    "ok": 1
+   },
+   "interactive\u001fdebian": {
+    "ok": 4
+   },
+   "interactive\u001frhel": {
+    "ok": 1
+   },
+   "no_fault\u001falpine": {
+    "ok": 1
+   },
+   "no_fault\u001fdebian": {
+    "ok": 4
+   },
+   "no_fault\u001frhel": {
+    "ok": 1
+   },
+   "persona\u001falpine": {
+    "fail": 1
+   },
+   "persona\u001fdebian": {
+    "ok": 4
+   },
+   "persona\u001frhel": {
+    "ok": 1
+   },
+   "transition_state\u001falpine": {
+    "ok": 1
+   },
+   "transition_state\u001fdebian": {
+    "ok": 4
+   },
+   "transition_state\u001frhel": {
+    "ok": 1
+   },
+   "vfs\u001falpine": {
+    "ok": 1
+   },
+   "vfs\u001fdebian": {
+    "ok": 4
+   },
+   "vfs\u001frhel": {
+    "ok": 1
+   }
+  },
+  "fid_memory": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fid_osnet": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fid_pipeline": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "ok": 6
+   }
+  },
+  "fid_which": {
+   "chain_dispatch\u001falpine": {
+    "ok": 1
+   },
+   "chain_dispatch\u001fdebian": {
+    "ok": 4
+   },
+   "chain_dispatch\u001frhel": {
+    "ok": 1
+   },
+   "downloader\u001falpine": {
+    "ok": 1
+   },
+   "downloader\u001fdebian": {
+    "ok": 4
+   },
+   "downloader\u001frhel": {
+    "ok": 1
+   },
+   "fact_ledger\u001falpine": {
+    "ok": 1
+   },
+   "fact_ledger\u001fdebian": {
+    "ok": 4
+   },
+   "fact_ledger\u001frhel": {
+    "ok": 1
+   },
+   "interactive\u001falpine": {
+    "ok": 1
+   },
+   "interactive\u001fdebian": {
+    "ok": 4
+   },
+   "interactive\u001frhel": {
+    "ok": 1
+   },
+   "no_fault\u001falpine": {
+    "ok": 1
+   },
+   "no_fault\u001fdebian": {
+    "ok": 4
+   },
+   "no_fault\u001frhel": {
+    "ok": 1
+   },
+   "persona\u001falpine": {
+    "fail": 1
+   },
+   "persona\u001fdebian": {
+    "fail": 4
+   },
+   "persona\u001frhel": {
+    "fail": 1
+   },
+   "transition_state\u001falpine": {
+    "ok": 1
+   },
+   "transition_state\u001fdebian": {
+    "ok": 4
+   },
+   "transition_state\u001frhel": {
+    "ok": 1
+   },
+   "vfs\u001falpine": {
+    "ok": 1
+   },
+   "vfs\u001fdebian": {
+    "ok": 4
+   },
+   "vfs\u001frhel": {
+    "ok": 1
+   }
+  },
+  "persona": {
+   "": {
+    "alpine": 8,
+    "debian": 32,
+    "rhel": 8
+   }
+  },
+  "probe_contradiction": {
+   "chain_dispatch": {
+    "clear": 6
+   },
+   "downloader": {
+    "clear": 6
+   },
+   "fact_ledger": {
+    "clear": 6
+   },
+   "interactive": {
+    "clear": 6
+   },
+   "no_fault": {
+    "clear": 6
+   },
+   "persona": {
+    "clear": 6
+   },
+   "transition_state": {
+    "clear": 6
+   },
+   "vfs": {
+    "clear": 6
+   }
+  },
+  "probe_prompt": {
+   "chain_dispatch": {
+    "clear": 6
+   },
+   "downloader": {
+    "clear": 6
+   },
+   "fact_ledger": {
+    "clear": 6
+   },
+   "interactive": {
+    "clear": 6
+   },
+   "no_fault": {
+    "clear": 6
+   },
+   "persona": {
+    "clear": 6
+   },
+   "transition_state": {
+    "clear": 6
+   },
+   "vfs": {
+    "clear": 6
+   }
+  },
+  "refusal_anomaly": {
+   "chain_dispatch": {
+    "ok": 6
+   },
+   "downloader": {
+    "ok": 6
+   },
+   "fact_ledger": {
+    "ok": 6
+   },
+   "interactive": {
+    "ok": 6
+   },
+   "no_fault": {
+    "ok": 6
+   },
+   "persona": {
+    "ok": 6
+   },
+   "transition_state": {
+    "ok": 6
+   },
+   "vfs": {
+    "refused": 6
+   }
+  }
+ },
+ "meta": {
+  "frozen_now": 1700000000.0,
+  "generator": "scripts/diagnoser_train.py",
+  "inert_nodes": [
+   "fid_fsperm",
+   "fid_identity",
+   "fid_memory",
+   "fid_osnet",
+   "fid_pipeline",
+   "probe_contradiction",
+   "probe_prompt"
+  ],
+  "personas": [
+   "ubuntu_22_04",
+   "ubuntu_20_04",
+   "debian_12",
+   "debian_11",
+   "centos_7",
+   "alpine_3_19"
+  ],
+  "repeats": 1,
+  "runs": 48,
+  "toggles": "defaults (deterministic_responses, pipe_filters, interactive_programs, capture_downloads all on)",
+  "version": "fidelity-v1"
+ },
+ "sha256": "1ffef194b1431b8b4c4f14058939545b0de91d7ab9a2e757a90f78e143850343",
+ "variables": [
+  {
+   "domain": [
+    "chain_dispatch",
+    "transition_state",
+    "vfs",
+    "persona",
+    "fact_ledger",
+    "downloader",
+    "interactive",
+    "no_fault"
+   ],
+   "name": "fault",
+   "parents": []
+  },
+  {
+   "domain": [
+    "debian",
+    "rhel",
+    "alpine"
+   ],
+   "name": "persona",
+   "parents": []
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_kernel_cpu",
+   "parents": [
+    "fault",
+    "persona"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_memory",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_identity",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_fsperm",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_which",
+   "parents": [
+    "fault",
+    "persona"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_osnet",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fail",
+    "ok"
+   ],
+   "name": "fid_pipeline",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fired",
+    "clear"
+   ],
+   "name": "probe_prompt",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "fired",
+    "clear"
+   ],
+   "name": "probe_contradiction",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "ok",
+    "defer_leak",
+    "intercept_missing",
+    "chain_reorder"
+   ],
+   "name": "download_path",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "doubled",
+    "ok"
+   ],
+   "name": "audit_append",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "leaked",
+    "ok"
+   ],
+   "name": "audit_refused_persist",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "entered",
+    "ok"
+   ],
+   "name": "audit_cd_absent",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "empty",
+    "ok"
+   ],
+   "name": "audit_ledger",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "model",
+    "local"
+   ],
+   "name": "audit_interactive",
+   "parents": [
+    "fault"
+   ]
+  },
+  {
+   "domain": [
+    "refused",
+    "ok"
+   ],
+   "name": "refusal_anomaly",
+   "parents": [
+    "fault"
+   ]
+  }
+ ],
+ "version": "fidelity-v1"
+}

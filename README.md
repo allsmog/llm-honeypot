@@ -416,6 +416,84 @@ coverage run --source=src/cowrie/llm -m twisted.trial cowrie.test.test_llm_*
 coverage report --include='*/cowrie/llm/*'
 ```
 
+## Bayesian fidelity diagnoser (offline)
+
+`cowrie/llm/intelligence/` answers a different question from the gates
+above. They tell you *that* the honeypot is wrong; this ranks *which
+subsystem* is wrong, given whichever signals happen to be in hand.
+
+**Nothing in the package runs in the live SSH path.** It is imported only
+by `scripts/` and tests. A test walks the package AST and fails if any
+module gains a runtime import outside the standard library and its own
+package, so the boundary is enforced rather than promised. No Monte Carlo
+sampling, no posterior, and no model artifact is reachable from a session.
+
+A hidden `fault` variable over eight families is observed through 16
+evidence nodes drawn from three instruments: the 35 fidelity invariants
+(collapsed into 7 groups — invariants inside a group read the same seam
+and fail together, so keeping them separate would count one observation up
+to eight times), the `probe_search` signals, and a **state-audit battery**
+that drives the real protocol and reads `WorldState` directly.
+
+That third instrument exists because of a finding worth stating plainly:
+**five of the eight fault families were invisible to the pre-existing
+signals.** `fidelity.py` never drives the protocol, the probe alphabet has
+no append-chain and no `cd` to an absent path, and a broken fact ledger
+*suppresses* the `self-contradiction` signal rather than tripping it. A
+fault family nothing can observe is not a modelling choice, it is a hole.
+
+**Ground truth comes from fault injection, not from priors.** Each switch
+in `intelligence/faults.py` re-introduces a bug this repository actually
+shipped and fixed — the chain double-apply, pre-transactional eager
+mutation, the `cd` that always succeeded, the `/var/tmp` over-refusal,
+hardcoded `GenuineIntel` above an AMD model name, `which` answering from a
+flat binary set, the ledger that recorded nothing, the interceptor treated
+as synchronous inside a chain. Only `interactive` is an ablation rather
+than a historical bug, and it says so. Every switch has an anti-vacuity
+test proving it flips the exact observation it claims.
+
+Exact inference (enumeration and variable elimination) is the oracle;
+likelihood weighting, Gibbs and Metropolis–Hastings are validated against
+it with total-variation gates on fixed seeds.
+
+```bash
+python scripts/diagnoser_train.py           # retrain, rewrite the artifact
+python scripts/diagnoser_train.py --check   # CI: must reproduce bit-for-bit
+python scripts/diagnose.py --self-test      # CI: inject each fault, identify it
+python scripts/diagnose.py --collect        # run the batteries and diagnose now
+python scripts/diagnose.py --evidence audit_append=doubled
+```
+
+`tox -e diagnose` runs the two CI modes and a workflow job runs it per PR.
+Training is 48 records in about 7 seconds. Counts are stored as integers
+with add-α smoothing applied at load, so the artifact hash is stable across
+platforms; `--check` fails if a code change alters what any battery
+observes, forcing a deliberate retrain rather than a model that quietly
+describes code that no longer exists.
+
+What it is honestly worth:
+
+- Under the frozen clock the fault→signal map is near-deterministic, so
+  the probabilistic machinery earns its place in three specific ways:
+  posteriors under **partial** evidence (CI hands you fidelity groups
+  before anyone has run the audit battery), fusion when signals conflict,
+  and ranking the most informative next check by expected information
+  gain. Given only a doubled append — which `chain_dispatch` and
+  `transition_state` both cause — it correctly reports no confident
+  diagnosis and names `audit_refused_persist`, the one check that
+  separates them, at 0.42 bits.
+- **Seven of the 16 evidence nodes never fired in training.** They are
+  printed on every training run and recorded in the artifact. Under
+  add-α smoothing an unseen value leaves the posterior untouched, which is
+  why a fault outside the eight families surfaces as low confidence rather
+  than a confident wrong answer — and `diagnose.py` says so explicitly
+  when an inert node reports trouble.
+- CPTs describe *our* fault switches, on six personas, at default config
+  toggles. They are not a model of how this honeypot fails in the wild.
+- Self-test identifies 16/16 injected faults, but that measures the
+  diagnoser against the same switches that trained it. It is a consistency
+  check, not evidence that a novel bug would be classified correctly.
+
 ## Known limitations
 
 - **scp upload capture (inbound).** `scp payload host:/path` runs
@@ -536,6 +614,13 @@ week's most valuable fix, and now gates against that regressing.
   as `routing_report` inherited the fastpath's. It also cannot see timing:
   the offline harness collapses the 1-10ms vs 300-2000ms gap that jitter
   only partly masks.
+- **The diagnoser ranks hypotheses; it does not gate anything.** Its
+  posterior is trained on injected versions of bugs we already found, so it
+  is good at recognising those and has no opinion about anything else. The
+  fidelity and probe harnesses decide whether a build fails; the diagnoser
+  only says where to look first when one does. Seven of its 16 evidence
+  nodes have never fired, and it reports that rather than implying coverage
+  it does not have.
 
 ## Known security caveats
 

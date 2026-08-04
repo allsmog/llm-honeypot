@@ -296,6 +296,15 @@ legacy_tox_ini = """
         python {toxinidir}/scripts/probe_search.py --sweep --max-depth 1 --min-depth 1
     basepython = python3.10
 
+    [testenv:diagnose]
+    description = Bayesian fidelity diagnoser: the committed model must retrain bit-for-bit from the fault-injection batteries, and every injected fault must be identified top-1. A hash mismatch means a battery now observes something different, which is a change worth reviewing rather than absorbing.
+    setenv =
+        PYTHONPATH = {toxinidir}/src
+    commands =
+        python {toxinidir}/scripts/diagnoser_train.py --check
+        python {toxinidir}/scripts/diagnose.py --self-test
+    basepython = python3.10
+
     [testenv:typing]
     description = run static type checkers
     extras =

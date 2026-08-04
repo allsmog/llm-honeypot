@@ -88,6 +88,32 @@ def _eval_persona(slug: str, *, reference: bool, min_similarity: float | None) -
     return ok
 
 
+def _emit_evidence(path: str, slug: str) -> None:
+    """Append what the diagnoser would observe from this persona's run.
+
+    One-way: this script never imports the network or computes a
+    posterior. Diagnosis is a separate tool reading a separate file, so a
+    broken diagnoser can never change whether the fidelity gate passes.
+    """
+    import json
+
+    from cowrie.llm.intelligence import evidence as evidencemod
+    from cowrie.llm.persona import pick_persona
+
+    checks = fidelity.run_consistency(fidelity.build_context(slug))
+    groups = evidencemod.group_failures(checks)
+    download_ok = groups.pop("_download_invariant_ok") == "ok"
+    record = {
+        "persona": pick_persona("", override=slug).family,
+        **groups,
+        # Only the fidelity view of the download path is available here;
+        # the audit and probe views come from their own harnesses.
+        "download_path": "ok" if download_ok else "defer_leak",
+    }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -103,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="opt-in: fail if any host-run command scores below "
                          "FLOOR (0-1). Off by default — reference is a readout, "
                          "the consistency invariants are the gate.")
+    ap.add_argument("--emit-evidence", metavar="PATH", default=None,
+                    help="append one JSON evidence line per persona for "
+                         "scripts/diagnose.py. Purely additive: the checks, "
+                         "the output and the exit code are unchanged.")
     args = ap.parse_args(argv)
 
     slugs = [p.slug for p in PERSONAS] if args.all_personas else [args.persona]
@@ -111,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         ok = _eval_persona(slug, reference=(args.reference == "local"),
                            min_similarity=args.enforce_similarity)
         all_ok = all_ok and ok
+        if args.emit_evidence:
+            _emit_evidence(args.emit_evidence, slug)
 
     print()
     if all_ok:

@@ -448,6 +448,28 @@ def sweep(alphabet: list[str], max_depth: int) -> list[tuple]:
     return results
 
 
+def _emit_evidence(path: str, persona_slug: str, findings: list) -> None:
+    """Append what the diagnoser would observe from this run.
+
+    One-way by design. This script never imports the network and never
+    computes a posterior: a broken diagnoser must not be able to change
+    whether the probe gate passes.
+    """
+    import json
+
+    from cowrie.llm.intelligence import evidence as evidencemod
+
+    slug = persona_slug if persona_slug != "auto" else personamod.PERSONAS[0].slug
+    record = {
+        "persona": personamod.pick_persona("", override=slug).family,
+        **evidencemod.probe_signals(findings),
+    }
+    if any(f.signal == evidencemod.DOWNLOAD_PROBE_SIGNAL for f in findings):
+        record["download_path"] = "intercept_missing"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Search for the shortest command sequence that detects the honeypot."
@@ -462,6 +484,13 @@ def main() -> int:
         type=int,
         default=99,
         help="fail if a detecting sequence shorter than this exists (default 99)",
+    )
+    parser.add_argument(
+        "--emit-evidence",
+        metavar="PATH",
+        default=None,
+        help="append a JSON evidence line for scripts/diagnose.py. Purely "
+        "additive: the search, the output and the exit code are unchanged.",
     )
     args = parser.parse_args()
 
@@ -478,6 +507,9 @@ def main() -> int:
                 on = ",".join(k for k, v in toggles.items() if v) or "all-off"
                 print(f"  {persona:<14} [{on}]")
                 print(f"      {findings[0].signal}: {' ; '.join(path)}")
+            if args.emit_evidence:
+                for persona, _toggles, _path, findings in results:
+                    _emit_evidence(args.emit_evidence, persona, findings)
             if detected:
                 print(
                     f"\nFAIL: {len(detected)}/{len(results)} configurations are "
@@ -493,6 +525,8 @@ def main() -> int:
         elapsed = time.time() - started
 
     print(f"sequences tried: {nodes} in {elapsed:.1f}s")
+    if args.emit_evidence:
+        _emit_evidence(args.emit_evidence, args.persona, findings)
     if not findings:
         print(f"\nOK: no detecting sequence found at depth <= {args.max_depth}.")
         print("     (means none exists in THIS alphabet at THIS depth — not that")
